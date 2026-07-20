@@ -623,10 +623,17 @@ pub struct RevisionUpdateRequest<'a> {
     pub extended_attributes: &'a str,
 }
 
+/// The `PUT` response body carries only the shared `Envelope` fields
+/// (`Code`, already checked inside `ApiClient::put` itself) with no payload
+/// this crate needs. An empty struct deserializes successfully from any JSON
+/// object, ignoring all its keys — unlike `()`, which `serde_json` only
+/// deserializes from a literal JSON `null`, never a JSON object, so it can't
+/// stand in for "no payload" on a response that's actually an object.
+#[derive(Deserialize)]
+struct CommitRevisionResponse {}
+
 /// `PUT v2/volumes/{volumeId}/files/{linkId}/revisions/{revisionId}` — the
-/// final step of an upload. `ApiResponse`'s only meaningful field is `Code`,
-/// already handled by `ApiClient::post`/`get`'s shared envelope check, so
-/// this returns `()` on success rather than a dedicated response type.
+/// final step of an upload.
 pub fn commit_revision(
     client: &ApiClient,
     volume_id: &str,
@@ -635,7 +642,8 @@ pub fn commit_revision(
     req: &RevisionUpdateRequest,
 ) -> Result<()> {
     let path = format!("v2/volumes/{volume_id}/files/{link_id}/revisions/{revision_id}");
-    client.put(&path, req)
+    client.put::<_, CommitRevisionResponse>(&path, req)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -654,5 +662,17 @@ mod block_upload_shape_tests {
         let json = r#"{"VerificationCode": "base64data"}"#;
         let parsed: VerificationInput = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.verification_code_b64, "base64data");
+    }
+
+    // Regression guard: `commit_revision` used to type its `put` call's
+    // response as `()`, but `serde_json` only deserializes `()` from a
+    // literal JSON `null`, never a JSON object — so it failed on every real
+    // (envelope-shaped) response, success or not. `CommitRevisionResponse`
+    // is an empty struct, which deserializes successfully from any object.
+    #[test]
+    fn commit_revision_response_deserializes_from_envelope_shaped_object() {
+        let json = r#"{"Code":1000,"SomeOtherField":"whatever"}"#;
+        assert!(serde_json::from_str::<CommitRevisionResponse>(json).is_ok());
+        assert!(serde_json::from_str::<()>(json).is_err());
     }
 }
