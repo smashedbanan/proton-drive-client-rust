@@ -1,6 +1,7 @@
 mod api;
 mod cli;
 mod config;
+mod crypto;
 mod error;
 mod srp;
 
