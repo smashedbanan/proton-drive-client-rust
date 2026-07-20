@@ -3,6 +3,7 @@ use base64::Engine;
 use num_bigint::BigUint;
 use pgp::composed::{CleartextSignedMessage, Deserializable, SignedPublicKey};
 use sha2::{Digest, Sha512};
+use rand::Rng;
 extern crate bcrypt;
 
 /// Modulus is always exactly 2048 bits.
@@ -106,6 +107,150 @@ pub fn compute_key_password(password: &[u8], key_salt_b64: &str) -> Result<Strin
     salt16.copy_from_slice(&raw_salt);
     let full_hash = bcrypt_full_hash(password, salt16)?;
     Ok(full_hash[29..].to_string())
+}
+
+/// Result of the client side of one SRP exchange.
+pub struct ClientProofs {
+    /// "A", base64, little-endian — send as ClientEphemeral.
+    pub client_ephemeral_b64: String,
+    /// "M1", base64 — send as ClientProof.
+    pub client_proof_b64: String,
+    /// "M2" — compare byte-for-byte against the server's returned ServerProof
+    /// before trusting the session. Do not skip this check.
+    pub expected_server_proof: Vec<u8>,
+}
+
+/// Runs the client side of Proton's SRP-6a variant: g=2 fixed, custom
+/// expand_hash in place of every H() call, little-endian throughout, and a
+/// simplified M1/M2 that hashes the raw premaster secret directly (no H(N)
+/// xor H(g), no username/salt, no K=H(S) indirection) — all confirmed by
+/// cross-reading Proton's own Go and TypeScript SRP implementations, which
+/// are byte-identical to each other.
+pub fn generate_proofs(
+    modulus: &BigUint,
+    server_ephemeral_b64: &str,
+    x: &BigUint,
+) -> Result<ClientProofs> {
+    let g = BigUint::from(2u32);
+    let n = modulus;
+    let n_minus_1 = n - 1u32;
+    let server_ephemeral_bytes = base64::engine::general_purpose::STANDARD
+        .decode(server_ephemeral_b64)
+        .map_err(|e| Error::Crypto(format!("bad server ephemeral base64: {e}")))?;
+    let server_ephemeral = BigUint::from_bytes_le(&server_ephemeral_bytes);
+
+    let k = {
+        let mut buf = le_bytes_fixed(&g);
+        buf.extend_from_slice(&le_bytes_fixed(n));
+        BigUint::from_bytes_le(&expand_hash(&buf)) % n
+    };
+    let v = g.modpow(x, n);
+
+    let zero = BigUint::from(0u32);
+    for _attempt in 0..10 {
+        let mut a_bytes = [0u8; MODULUS_BYTE_LEN];
+        rand::rng().fill_bytes(&mut a_bytes);
+        let a = BigUint::from_bytes_le(&a_bytes);
+        let big_a = g.modpow(&a, n);
+        if big_a == zero {
+            continue;
+        }
+
+        let u = BigUint::from_bytes_le(&expand_hash(
+            &[le_bytes_fixed(&big_a), le_bytes_fixed(&server_ephemeral)].concat(),
+        ));
+        if u == zero {
+            continue;
+        }
+
+        let kv_mod = (&k * &v) % n;
+        let base = (&server_ephemeral + n - &kv_mod) % n;
+        let exponent = (&a + &u * x) % &n_minus_1;
+        let s = base.modpow(&exponent, n);
+
+        let m1 = expand_hash(
+            &[
+                le_bytes_fixed(&big_a),
+                le_bytes_fixed(&server_ephemeral),
+                le_bytes_fixed(&s),
+            ]
+            .concat(),
+        );
+        let m2 = expand_hash(&[le_bytes_fixed(&big_a), m1.clone(), le_bytes_fixed(&s)].concat());
+
+        return Ok(ClientProofs {
+            client_ephemeral_b64: base64::engine::general_purpose::STANDARD
+                .encode(le_bytes_fixed(&big_a)),
+            client_proof_b64: base64::engine::general_purpose::STANDARD.encode(&m1),
+            expected_server_proof: m2,
+        });
+    }
+
+    Err(Error::Crypto(
+        "failed to generate a non-degenerate SRP ephemeral after 10 attempts".into(),
+    ))
+}
+
+#[cfg(test)]
+mod exchange_tests {
+    use super::*;
+
+    const TEST_MODULUS_CLEARSIGN: &str = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nW2z5HBi8RvsfYzZTS7qBaUxxPhsfHJFZpu3Kd6s1JafNrCCH9rfvPLrfuqocxWPgWDH2R8neK7PkNvjxto9TStuY5z7jAzWRvFWN9cQhAKkdWgy0JY6ywVn22+HFpF4cYesHrqFIKUPDMSSIlWjBVmEJZ/MusD44ZT29xcPrOqeZvwtCffKtGAIjLYPZIEbZKnDM1Dm3q2K/xS5h+xdhjnndhsrkwm9U9oyA2wxzSXFL+pdfj2fOdRwuR5nW0J2NFrq3kJjkRmpO/Genq1UW+TEknIWAb6VzJJJA244K/H8cnSx2+nSNZO3bbo6Ys228ruV9A8m6DhxmS+bihN3ttQ==\n-----BEGIN PGP SIGNATURE-----\nVersion: ProtonMail\nComment: https://protonmail.com\n\nwl4EARYIABAFAlwB1j0JEDUFhcTpUY8mAAD8CgEAnsFnF4cF0uSHKkXa1GIa\nGO86yMV4zDZEZcDSJo0fgr8A/AlupGN9EdHlsrZLmTA1vhIx+rOgxdEff28N\nkvNM7qIK\n=q6vu\n-----END PGP SIGNATURE-----";
+
+    /// go-srp's own reference test (TestSRPauth) uses a seeded Go RNG for the
+    /// client ephemeral, whose output sequence cannot be reproduced in Rust —
+    /// so this checks self-consistency instead (mirrors go-srp's own
+    /// TestE2EFlow): compute a verifier and a toy "server" side by hand using
+    /// the REAL Proton modulus, and confirm our client-side math derives the
+    /// same shared secret and a server-proof the toy server would actually
+    /// send. This exact approach (with these exact formulas) was run and
+    /// verified during planning, including catching and fixing a modulus
+    /// byte-order bug — do not simplify this test away.
+    #[test]
+    fn srp_exchange_is_internally_consistent_against_real_modulus() {
+        let n = verify_and_decode_modulus(TEST_MODULUS_CLEARSIGN).unwrap();
+        let g = BigUint::from(2u32);
+
+        let x = BigUint::from_bytes_le(&expand_hash(b"toy-x-input"));
+        let v = g.modpow(&x, &n);
+
+        let k = {
+            let mut buf = le_bytes_fixed(&g);
+            buf.extend_from_slice(&le_bytes_fixed(&n));
+            BigUint::from_bytes_le(&expand_hash(&buf)) % &n
+        };
+
+        // toy "server" side, done by hand in the test only
+        let b = BigUint::from_bytes_le(&expand_hash(b"toy-server-ephemeral")) % &n;
+        let server_ephemeral = (&k * &v + g.modpow(&b, &n)) % &n;
+
+        let proofs = generate_proofs(
+            &n,
+            &base64::engine::general_purpose::STANDARD.encode(le_bytes_fixed(&server_ephemeral)),
+            &x,
+        )
+        .unwrap();
+
+        let big_a_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&proofs.client_ephemeral_b64)
+            .unwrap();
+        let big_a = BigUint::from_bytes_le(&big_a_bytes);
+
+        // recompute the toy server's view of the shared secret independently
+        let u = BigUint::from_bytes_le(&expand_hash(
+            &[le_bytes_fixed(&big_a), le_bytes_fixed(&server_ephemeral)].concat(),
+        ));
+        let s_server = ((&big_a * v.modpow(&u, &n)) % &n).modpow(&b, &n);
+        let m2_from_server_view =
+            expand_hash(&[le_bytes_fixed(&big_a), base64::engine::general_purpose::STANDARD
+                .decode(&proofs.client_proof_b64)
+                .unwrap(), le_bytes_fixed(&s_server)].concat());
+
+        assert_eq!(
+            proofs.expected_server_proof, m2_from_server_view,
+            "client's expected server proof must match what a real server would compute"
+        );
+    }
 }
 
 #[cfg(test)]
