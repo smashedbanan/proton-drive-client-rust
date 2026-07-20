@@ -88,6 +88,25 @@ impl ApiClient {
         parse_response(response)
     }
 
+    pub fn put<Req: Serialize, Resp: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Req,
+    ) -> Result<Resp> {
+        let url = format!("{API_BASE_URL}/{path}");
+        let req = self.agent.put(&url).header("x-pm-appversion", APP_VERSION);
+        let req = if let Some((uid, token)) = &self.session {
+            req.header("x-pm-uid", uid)
+                .header("Authorization", &format!("Bearer {token}"))
+        } else {
+            req
+        };
+        let response = req
+            .send_json(body)
+            .map_err(|e| Error::Network(e.to_string()))?;
+        parse_response(response)
+    }
+
     /// Same shape as `post` above (headers, session auth), but sends a
     /// multipart body instead of JSON — used only by the small-file upload
     /// path (`api::drive::upload_small_file`/`upload_small_revision`), which

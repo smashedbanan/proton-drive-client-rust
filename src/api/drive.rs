@@ -611,6 +611,33 @@ pub fn get_verification_input(
     client.get(&path)
 }
 
+#[derive(Serialize)]
+pub struct RevisionUpdateRequest<'a> {
+    #[serde(rename = "ManifestSignature")]
+    pub manifest_signature: &'a str,
+    #[serde(rename = "SignatureAddress")]
+    pub signature_email_address: &'a str,
+    #[serde(rename = "ChecksumVerified")]
+    pub checksum_verified: bool,
+    #[serde(rename = "XAttr")]
+    pub extended_attributes: &'a str,
+}
+
+/// `PUT v2/volumes/{volumeId}/files/{linkId}/revisions/{revisionId}` — the
+/// final step of an upload. `ApiResponse`'s only meaningful field is `Code`,
+/// already handled by `ApiClient::post`/`get`'s shared envelope check, so
+/// this returns `()` on success rather than a dedicated response type.
+pub fn commit_revision(
+    client: &ApiClient,
+    volume_id: &str,
+    link_id: &str,
+    revision_id: &str,
+    req: &RevisionUpdateRequest,
+) -> Result<()> {
+    let path = format!("v2/volumes/{volume_id}/files/{link_id}/revisions/{revision_id}");
+    client.put(&path, req)
+}
+
 #[cfg(test)]
 mod block_upload_shape_tests {
     use super::*;
