@@ -69,6 +69,36 @@ impl ApiClient {
         parse_response(response)
     }
 
+    /// Same as `get` above, but adds one percent-encoded query parameter via
+    /// `ureq`'s own `RequestBuilder::query` — used by
+    /// `api::drive::list_folder_children`'s `AnchorID` pagination parameter,
+    /// which needs percent-encoding that a hand-built `format!` URL doesn't
+    /// get. Doesn't replace `get`'s signature (still used, unparameterized,
+    /// by `api/auth.rs`/`api/account.rs`).
+    pub fn get_with_query<Resp: DeserializeOwned>(
+        &self,
+        path: &str,
+        query_key: &str,
+        query_value: &str,
+    ) -> Result<Resp> {
+        let url = format!("{API_BASE_URL}/{path}");
+        let req = self
+            .agent
+            .get(&url)
+            .header("x-pm-appversion", APP_VERSION)
+            .query(query_key, query_value);
+        let req = if let Some((uid, token)) = &self.session {
+            req.header("x-pm-uid", uid)
+                .header("Authorization", &format!("Bearer {token}"))
+        } else {
+            req
+        };
+        let response = req
+            .call()
+            .map_err(|e| Error::Network(e.to_string()))?;
+        parse_response(response)
+    }
+
     pub fn post<Req: Serialize, Resp: DeserializeOwned>(
         &self,
         path: &str,

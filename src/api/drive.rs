@@ -89,11 +89,10 @@ pub fn list_folder_children(
     anchor: Option<&str>,
 ) -> Result<ChildrenResponse> {
     let path = format!("v2/volumes/{volume_id}/folders/{folder_link_id}/children");
-    let path = match anchor {
-        Some(anchor) => format!("{path}?AnchorID={anchor}"),
-        None => path,
-    };
-    client.get(&path)
+    match anchor {
+        Some(anchor) => client.get_with_query(&path, "AnchorID", anchor),
+        None => client.get(&path),
+    }
 }
 
 #[derive(Serialize)]
