@@ -175,7 +175,7 @@ pub fn generate_node_key(parent: &UnlockedKey, address_signing_key: &UnlockedKey
 /// (including ones held only as secret material, e.g. our own freshly
 /// generated ones) via `public_subkeys`; prefer the first one, falling back
 /// to the primary for single-key shapes (e.g. this module's RSA test keys).
-fn encrypt_to_key(plaintext: &[u8], key: &UnlockedKey) -> Result<String> {
+pub(crate) fn encrypt_to_key(plaintext: &[u8], key: &UnlockedKey) -> Result<String> {
     let rng = rand08::rngs::OsRng;
     let mut builder = pgp::composed::MessageBuilder::from_bytes("", plaintext.to_vec())
         .seipd_v1(rng, SymmetricKeyAlgorithm::AES256);
