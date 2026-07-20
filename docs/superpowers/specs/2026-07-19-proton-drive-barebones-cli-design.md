@@ -20,7 +20,7 @@ Proton's operational requirements for any third-party client (from the SDK READM
 ## Scope
 
 **In scope:**
-- `login` — SRP authentication, 2FA (TOTP) support, single-password mode only (login password decrypts the private key directly; no separate mailbox password).
+- `login` — SRP authentication, single-password mode only (login password decrypts the private key directly; no separate mailbox password).
 - `logout` — clear the local session.
 - `upload <local-file> <remote-path>` — encrypt and upload a single file to an existing remote folder.
 - `download <remote-path> <local-file>` — download and decrypt a single file.
@@ -29,6 +29,7 @@ Proton's operational requirements for any third-party client (from the SDK READM
 - TUI (planned as a later milestone on top of this).
 - File/folder listing, browsing, move/rename/trash, sharing.
 - Two-password mode (separate mailbox password).
+- **2FA (TOTP) support** — deferred to a fast-follow. Implementation-planning research found Proton's own reference SDK/CLI has no working 2FA call site anywhere to copy (the `/auth/2fa` endpoint exists only in generated API types, with zero real call sites); password-only SRP, by contrast, is provable against known test vectors before ever touching a live account. Shipping that first isolates risk to the one path that already has a working reference (native SRP clients); 2FA gets built and live-tested as its own follow-up once the core flow is confirmed.
 - Multi-file or recursive/directory transfers.
 - Sync, event polling, caching layers.
 - Automatic retry/backoff on API errors.
