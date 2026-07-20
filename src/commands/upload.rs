@@ -169,6 +169,42 @@ fn upload_general(ctx: &UploadContext, file: &mut File) -> Result<String> {
         signature_email_address: &ctx.address.email,
     };
 
+    // ponytail: KNOWN CORRECTNESS GAP, not a stylistic shortcut — flagging
+    // for whoever picks this up next, not silently working around it.
+    // `create_revision` below only registers a new revision on
+    // `existing_link_id`; it never fetches that node's *real* NodeKey or
+    // ContentKeyPacket. Every block below then encrypts under `ctx`'s
+    // freshly-generated `new_node_key`/`content_key` (from `run`) instead —
+    // a key nobody but this one process ever knew, and that is never sent
+    // to the server for this existing node (`RevisionCreationRequest` and
+    // `SmallRevisionUploadMetadata` carry no key fields at all, confirming
+    // the server expects the *existing* content key to be reused, not
+    // replaced). So today, re-uploading to a path that already has a file
+    // reports success but produces a revision nobody can ever decrypt —
+    // confirmed against the real reference SDK during Task 11's adversarial
+    // review: `client/js/src/internal/upload/manager.ts:97-98` refuses to
+    // create a revision at all without an already-resolved
+    // `nodeKeys.contentKeyPacketSessionKey`; that session key comes from
+    // decrypting `Link.File.ContentKeyPacket`/`ContentKeyPacketSignature`
+    // (`client/js/src/internal/nodes/apiService.ts:730-731`) via the
+    // node's own unlocked key (`client/js/src/internal/nodes/cryptoService.ts:517-534`).
+    // Fixing this for real needs: (1) `api::drive::LinkDetails` extended
+    // with those two `File`-nested fields (not currently fetched anywhere
+    // in this crate — Task 2's scope never needed a file's content key,
+    // only folders' names/keys for path walking), and (2) a new
+    // `crypto::` function to decrypt an existing content-key packet via
+    // the node's own secret subkey — the underlying `pgp`-crate mechanism
+    // is already proven, just not in production code:
+    // `crypto::content_key_tests::generate_content_key_packet_decrypts_back_via_the_node_keys_own_secret_subkey`.
+    // Not fixed here: it reaches into already-reviewed Tasks 2/5/6, and
+    // this crate's own `generate_content_key` (Task 5) writes
+    // `ContentKeyPacket` as a headerless PKESK body (see that function's
+    // own doc comment), which is unverified against what a real Proton
+    // server / other real clients' packets actually look like on the wire
+    // without a live account to test against — guessing at that byte
+    // format risked shipping something that *looks* fixed but is silently
+    // wrong in a different way. See Task 11's report for the full
+    // citations and reasoning.
     let (link_id, revision_id) = match create_file(ctx.client, &ctx.folder.volume_id, &file_creation)? {
         CreateFileOutcome::Created(ids) => (ids.link_id, ids.revision_id),
         CreateFileOutcome::NameConflict(conflict) => {
@@ -274,6 +310,10 @@ fn upload_small(ctx: &UploadContext, file: &mut File) -> Result<String> {
         extended_attributes: &xattr_armored,
     };
 
+    // ponytail: same known gap as `upload_general`'s `NameConflict` arm —
+    // see the full comment there. `upload_small_revision` below also never
+    // reuses the existing node's real content key; this path encrypted
+    // `encrypted_block` under the freshly-generated `ctx.content_key` above.
     match upload_small_file(ctx.client, &ctx.folder.volume_id, &new_file_metadata, &encrypted_block.ciphertext)? {
         CreateFileOutcome::Created(ids) => Ok(ids.revision_id),
         CreateFileOutcome::NameConflict(conflict) => {
@@ -309,19 +349,19 @@ fn upload_small(ctx: &UploadContext, file: &mut File) -> Result<String> {
 /// 3339, matching typical Proton API date conventions") and the literal
 /// `"2026-07-20T00:00:00Z"`-shaped value Task 9's own round-trip test
 /// constructs — a raw Unix-seconds digit string would satisfy the field's
-/// `String` type but would not actually be RFC 3339. Falls back to the
-/// Unix epoch if the platform can't report an mtime at all
-/// (`Metadata::modified`'s documented failure case) rather than failing
-/// the whole upload over a metadata nicety.
+/// `String` type but would not actually be RFC 3339. Falls back to (and
+/// clamps to) the Unix epoch if the platform can't report an mtime at all,
+/// or reports one before it (`Metadata::modified`'s documented failure
+/// case, plus a pre-1970 mtime, which `.modified()` itself returns `Ok`
+/// for — confirmed empirically against a real file with `touch -d
+/// 1965-01-01`) — `humantime::Rfc3339Timestamp`'s `Display` impl panics
+/// (`.duration_since(UNIX_EPOCH).expect(...)`) on a pre-epoch value rather
+/// than erroring, so this must never hand it one.
 fn build_xattr(file: &mut File, file_size: u64, block_sizes: Vec<u64>, node_key: &NewNodeKey) -> Result<String> {
     file.rewind().map_err(Error::Io)?;
     let sha1_hex = compute_whole_file_sha1(&mut *file)?;
-    let modified = file
-        .metadata()
-        .map_err(Error::Io)?
-        .modified()
-        .unwrap_or(std::time::UNIX_EPOCH);
-    let modification_time = humantime::format_rfc3339_seconds(modified).to_string();
+    let modified = file.metadata().map_err(Error::Io)?.modified().unwrap_or(std::time::UNIX_EPOCH);
+    let modification_time = humantime::format_rfc3339_seconds(clamp_to_unix_epoch(modified)).to_string();
     let extended_attributes = ExtendedAttributes {
         common: ExtendedAttributesCommon {
             total_size: file_size,
@@ -331,4 +371,37 @@ fn build_xattr(file: &mut File, file_size: u64, block_sizes: Vec<u64>, node_key:
         },
     };
     build_extended_attributes(&extended_attributes, node_key)
+}
+
+/// `humantime::Rfc3339Timestamp`'s `Display` impl panics
+/// (`.duration_since(UNIX_EPOCH).expect(...)`) rather than erroring on a
+/// pre-epoch `SystemTime` — and `Metadata::modified()` genuinely can
+/// return one `Ok(...)` (confirmed empirically against a real file with
+/// `touch -d 1965-01-01`), so it never hits the separate `unwrap_or`
+/// fallback above (that only covers `.modified()` itself failing). Every
+/// mtime must be clamped through here before it ever reaches the
+/// formatter.
+fn clamp_to_unix_epoch(t: std::time::SystemTime) -> std::time::SystemTime {
+    t.max(std::time::UNIX_EPOCH)
+}
+
+#[cfg(test)]
+mod xattr_tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    // Regression guard for a real panic found by adversarial review: a
+    // file with a pre-1970 mtime used to crash the whole upload (a panic,
+    // not a `Result::Err`) when its modification time reached
+    // `humantime::format_rfc3339_seconds`, because `.modified()` returns
+    // `Ok` for pre-epoch times too (the code's old `unwrap_or` fallback
+    // only ever triggered on `Err`, never on this case).
+    #[test]
+    fn pre_epoch_mtime_is_clamped_and_formats_without_panicking() {
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(60 * 60 * 24 * 365 * 5); // ~1965
+        assert_eq!(clamp_to_unix_epoch(pre_epoch), UNIX_EPOCH);
+
+        let formatted = humantime::format_rfc3339_seconds(clamp_to_unix_epoch(pre_epoch)).to_string();
+        assert_eq!(formatted, "1970-01-01T00:00:00Z");
+    }
 }
