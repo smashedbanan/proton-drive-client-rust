@@ -450,6 +450,21 @@ mod conflict_outcome_tests {
         assert!(conflict_outcome(err).is_err());
     }
 
+    // Regression guard: the match arm that extracts a conflict requires
+    // *both* `code == ALREADY_EXISTS_CODE` *and* `details: Some(..)` — a
+    // same-code response with no details body must fall through to the
+    // catch-all `Err(e) => Err(e)` arm (propagated as a real error) rather
+    // than panicking or being silently treated as a conflict.
+    #[test]
+    fn already_exists_code_without_details_is_not_treated_as_a_conflict() {
+        let err: Result<i32> = Err(Error::Api {
+            code: ALREADY_EXISTS_CODE,
+            message: "already exists".into(),
+            details: None,
+        });
+        assert!(conflict_outcome(err).is_err());
+    }
+
     #[test]
     fn errors_clearly_on_malformed_conflict_details() {
         let err: Result<i32> = Err(Error::Api {
