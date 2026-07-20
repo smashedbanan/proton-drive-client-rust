@@ -22,3 +22,6 @@ target
 
 # Local planning/spec docs — not meant to be pushed to the remote
 docs/superpowers/
+
+# Implementation worktrees (superpowers:using-git-worktrees)
+.claude/worktrees/
