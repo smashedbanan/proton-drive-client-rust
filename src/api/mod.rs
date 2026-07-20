@@ -46,6 +46,14 @@ impl ApiClient {
         client
     }
 
+    /// Escape hatch for `api::drive::upload_block_bytes`, which must send a
+    /// request with a completely different header set (a `pm-storage-token`
+    /// instead of this client's session bearer token, to an opaque runtime
+    /// URL outside `API_BASE_URL`) — not expressible through `post`/`get`.
+    pub fn agent(&self) -> &ureq::Agent {
+        &self.agent
+    }
+
     pub fn get<Resp: DeserializeOwned>(&self, path: &str) -> Result<Resp> {
         let url = format!("{API_BASE_URL}/{path}");
         let req = self.agent.get(&url).header("x-pm-appversion", APP_VERSION);

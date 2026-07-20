@@ -1,4 +1,5 @@
 use super::ApiClient;
+use crate::config::APP_VERSION;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use ureq::unversioned::multipart::{Form, Part};
@@ -473,5 +474,143 @@ mod conflict_outcome_tests {
             details: Some(serde_json::json!("not an object")),
         });
         assert!(conflict_outcome(err).is_err());
+    }
+}
+
+#[derive(Serialize)]
+pub struct BlockRegistration<'a> {
+    #[serde(rename = "Index")]
+    pub index: i64,
+    #[serde(rename = "Size")]
+    pub size: i64,
+    #[serde(rename = "EncSignature")]
+    pub encrypted_signature: &'a str,
+    #[serde(rename = "Hash")]
+    pub hash_b64: &'a str,
+    #[serde(rename = "Verifier")]
+    pub verifier: VerifierPayload<'a>,
+}
+
+#[derive(Serialize)]
+pub struct VerifierPayload<'a> {
+    #[serde(rename = "Token")]
+    pub token_b64: &'a str,
+}
+
+#[derive(Serialize)]
+struct BlockUploadPreparationRequest<'a> {
+    #[serde(rename = "AddressID")]
+    address_id: &'a str,
+    #[serde(rename = "VolumeID")]
+    volume_id: &'a str,
+    #[serde(rename = "LinkID")]
+    link_id: &'a str,
+    #[serde(rename = "RevisionID")]
+    revision_id: &'a str,
+    #[serde(rename = "BlockList")]
+    blocks: &'a [BlockRegistration<'a>],
+    #[serde(rename = "ThumbnailList")]
+    thumbnails: &'a [EmptyThumbnail],
+}
+
+/// Never constructed — `ThumbnailList` is always empty (thumbnails are out
+/// of scope for this crate), but the field still needs a concrete element
+/// type to serialize an empty array.
+#[derive(Serialize)]
+pub enum EmptyThumbnail {}
+
+// No `Debug` on `BlockUploadTarget` (`token` is a bearer credential for the
+// block-upload PUT, the same category as `api::auth::AuthResponse`'s
+// `access_token`/`refresh_token`, which also don't derive `Debug`) or on
+// `BlockUploadPreparationResponse`, which contains it.
+#[derive(Deserialize)]
+pub struct BlockUploadTarget {
+    #[serde(rename = "BareURL")]
+    pub bare_url: String,
+    #[serde(rename = "Token")]
+    pub token: String,
+}
+
+#[derive(Deserialize)]
+struct BlockUploadPreparationResponse {
+    #[serde(rename = "UploadLinks")]
+    upload_targets: Vec<BlockUploadTarget>,
+}
+
+/// `POST blocks` (no volume/file prefix in the path — confirmed against
+/// the real reference SDK, not a typo). Registers one or more blocks and
+/// returns a per-block signed upload URL + token.
+pub fn prepare_block_upload(
+    client: &ApiClient,
+    address_id: &str,
+    volume_id: &str,
+    link_id: &str,
+    revision_id: &str,
+    blocks: &[BlockRegistration],
+) -> Result<Vec<BlockUploadTarget>> {
+    let req = BlockUploadPreparationRequest {
+        address_id,
+        volume_id,
+        link_id,
+        revision_id,
+        blocks,
+        thumbnails: &[],
+    };
+    let resp: BlockUploadPreparationResponse = client.post("blocks", &req)?;
+    Ok(resp.upload_targets)
+}
+
+/// Uploads one block's encrypted bytes directly to its per-block `bare_url`,
+/// authenticated by the distinct `pm-storage-token` header (not the crate's
+/// normal session bearer token) as `multipart/form-data` with one part
+/// named `Block`. Bypasses `ApiClient::post` entirely since this targets an
+/// opaque runtime URL outside the API base, with different auth.
+pub fn upload_block_bytes(agent: &ureq::Agent, target: &BlockUploadTarget, ciphertext: &[u8]) -> Result<()> {
+    let form = Form::new().part("Block", Part::bytes(ciphertext));
+    agent
+        .post(&target.bare_url)
+        .header("x-pm-appversion", APP_VERSION)
+        .header("pm-storage-token", &target.token)
+        .send(form)
+        .map_err(|e| Error::Network(e.to_string()))?;
+    Ok(())
+}
+
+#[derive(Deserialize, Debug)]
+pub struct VerificationInput {
+    #[serde(rename = "VerificationCode")]
+    pub verification_code_b64: String,
+}
+
+/// `GET v2/volumes/{volumeId}/links/{linkId}/revisions/{revisionId}/verification` —
+/// fetches the server-issued verification code for the regular (multi-block)
+/// upload path. The small-file path derives its verification code locally
+/// instead (the content key packet's own tail bytes) and never calls this.
+pub fn get_verification_input(
+    client: &ApiClient,
+    volume_id: &str,
+    link_id: &str,
+    revision_id: &str,
+) -> Result<VerificationInput> {
+    let path = format!("v2/volumes/{volume_id}/links/{link_id}/revisions/{revision_id}/verification");
+    client.get(&path)
+}
+
+#[cfg(test)]
+mod block_upload_shape_tests {
+    use super::*;
+
+    #[test]
+    fn block_upload_preparation_response_deserializes() {
+        let json = r#"{"UploadLinks": [{"BareURL": "https://example.com/blob", "Token": "tok"}]}"#;
+        let parsed: BlockUploadPreparationResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.upload_targets[0].bare_url, "https://example.com/blob");
+    }
+
+    #[test]
+    fn verification_input_deserializes() {
+        let json = r#"{"VerificationCode": "base64data"}"#;
+        let parsed: VerificationInput = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.verification_code_b64, "base64data");
     }
 }
