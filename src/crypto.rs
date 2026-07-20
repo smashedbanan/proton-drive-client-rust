@@ -120,7 +120,8 @@ pub fn generate_node_key(parent: &UnlockedKey, address_signing_key: &UnlockedKey
         .key_type(KeyType::ECDH(ECCCurve::Curve25519Legacy))
         .can_sign(false)
         .can_encrypt(EncryptionCaps::All)
-        .can_authenticate(false);
+        .can_authenticate(false)
+        .passphrase(Some(passphrase.clone()));
 
     let mut key_params = SecretKeyParamsBuilder::default();
     key_params
@@ -444,11 +445,11 @@ mod content_key_tests {
             .first()
             .expect("node key has a secret encryption subkey")
             .key;
-        // The encryption subkey was never given its own passphrase in
-        // `generate_node_key` (only the primary was), so it's unlocked with
-        // an empty password.
+        // The encryption subkey is locked with the same freshly-generated
+        // passphrase as the primary key (see `generate_node_key`), so it
+        // must be unlocked with that real passphrase, not an empty one.
         let decrypted = secret_subkey
-            .decrypt(&Password::empty(), &values, pgp::types::EskType::V3_4)
+            .decrypt(&Password::from(node_key.passphrase.as_str()), &values, pgp::types::EskType::V3_4)
             .expect("decrypt should not error")
             .expect("decrypted session key should be valid");
         let pgp::composed::PlainSessionKey::V3_4 { ref key, .. } = decrypted else {
