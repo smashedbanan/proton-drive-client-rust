@@ -3,6 +3,7 @@ mod cli;
 mod commands;
 mod config;
 mod crypto;
+mod drive;
 mod error;
 mod session;
 mod srp;

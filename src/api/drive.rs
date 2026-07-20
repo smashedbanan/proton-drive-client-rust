@@ -65,16 +65,20 @@ pub struct ChildrenResponse {
 
 /// `GET v2/volumes/{volumeId}/folders/{linkId}/children` — bare link IDs
 /// only, no names/keys (those need a separate `get_link_details` call per
-/// ID). No pagination handling here: `more`/`anchor_id` are surfaced to the
-/// caller (`drive::resolve_path`, Task 4) rather than looped internally, so
-/// path resolution can decide how many pages a folder-name search actually
-/// needs to walk.
+/// ID). `anchor` is the previous page's `AnchorID` (from `ChildrenResponse`)
+/// to fetch the next page when `more` was true, matching the reference
+/// SDKs' own query-parameter pagination; pass `None` for the first page.
 pub fn list_folder_children(
     client: &ApiClient,
     volume_id: &str,
     folder_link_id: &str,
+    anchor: Option<&str>,
 ) -> Result<ChildrenResponse> {
     let path = format!("v2/volumes/{volume_id}/folders/{folder_link_id}/children");
+    let path = match anchor {
+        Some(anchor) => format!("{path}?AnchorID={anchor}"),
+        None => path,
+    };
     client.get(&path)
 }
 
