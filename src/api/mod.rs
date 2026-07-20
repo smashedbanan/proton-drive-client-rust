@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod account;
 pub mod auth;
+pub mod drive;
 
 /// Every Proton API response carries a top-level Code (1000 == success) and,
 /// on failure, an Error message — independent of HTTP status. We disable
