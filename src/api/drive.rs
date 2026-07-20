@@ -8,7 +8,7 @@ pub struct ShareVolume {
     pub id: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct Share {
     #[serde(rename = "Key")]
     pub key: String,
@@ -24,7 +24,7 @@ pub struct Share {
 /// into it. `node_passphrase`/`node_key` are absent for a link this account
 /// only has read access to via a different key chain — not a case we need
 /// to handle (`/my-files/...` only, this account's own tree).
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct LinkDetails {
     #[serde(rename = "LinkID")]
     pub link_id: String,
@@ -36,7 +36,7 @@ pub struct LinkDetails {
     pub node_passphrase: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct ShareResponse {
     #[serde(rename = "Volume")]
     pub volume: ShareVolume,
@@ -84,7 +84,7 @@ struct LinkDetailsRequest<'a> {
     link_ids: &'a [String],
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct LinkDetailsResponse {
     #[serde(rename = "Links")]
     pub links: Vec<LinkDetails>,
