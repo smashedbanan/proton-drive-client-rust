@@ -386,6 +386,17 @@ mod content_key_tests {
         let new_key = generate_node_key(&parent, &address_signing_key).unwrap();
         let recovered_passphrase = decrypt_message(&new_key.encrypted_passphrase_armored, &parent).unwrap();
 
+        // Regression guard, mirroring the one below for the encryption
+        // subkey: `SecretKey::unlock` (called transitively by
+        // `UnlockedKey::new` below) ignores whatever `Password` it's given
+        // when the secret material is still `SecretParams::Plain`
+        // (unencrypted) — it only checks the password once the key is
+        // genuinely `Encrypted`. So if `.passphrase(Some(passphrase.clone()))`
+        // were ever dropped from the primary `key_params` builder in
+        // `generate_node_key`, the `is_ok()` assertion below would keep
+        // passing unchanged. This checks the actual lock state directly,
+        // independent of that.
+        assert!(new_key.secret_key.primary_key.secret_params().is_encrypted());
         // The recovered passphrase must actually unlock the generated key.
         assert!(UnlockedKey::new(&new_key.armored_key, recovered_passphrase).is_ok());
     }
