@@ -3,6 +3,8 @@ use crate::error::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+pub mod auth;
+
 /// Every Proton API response carries a top-level Code (1000 == success) and,
 /// on failure, an Error message — independent of HTTP status. We disable
 /// ureq's automatic status-code-as-error behavior so we always get the body
