@@ -3,6 +3,7 @@ use crate::error::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+pub mod account;
 pub mod auth;
 
 /// Every Proton API response carries a top-level Code (1000 == success) and,
