@@ -401,6 +401,127 @@ pub fn compute_verification_token(ciphertext: &[u8], verification_code: &[u8]) -
         .collect()
 }
 
+/// Concatenates `block_hashes` in order (thumbnails always precede content
+/// blocks in the reference protocol, but this crate never has thumbnails,
+/// so `block_hashes` here is content-blocks-only, in upload order) and
+/// signs the result — the `ManifestSignature` wire field.
+pub fn build_manifest_signature(block_hashes: &[[u8; 32]], signing_key: &UnlockedKey) -> Result<String> {
+    let manifest: Vec<u8> = block_hashes.iter().flatten().copied().collect();
+    sign_detached(&manifest, signing_key)
+}
+
+/// The plaintext content of the `XAttr` wire field before it's PGP-encrypted
+/// and signed. Field names mirror the reference SDKs' `Common`/`Digests`
+/// shape (see the upload design doc) — serialized as JSON before encryption,
+/// matching how both reference SDKs build this blob as a small JSON document.
+///
+/// Derives `serde::Serialize` via a fully-qualified path in the `#[derive]`
+/// attribute rather than a top-of-file `use serde::Serialize;`: this module
+/// already imports the unrelated `pgp::ser::Serialize` trait (used for PGP
+/// packet wire serialization, e.g. `generate_content_key`'s
+/// `packet.to_writer(...)`), and both traits share the bare name
+/// `Serialize` — importing both under that name would collide.
+#[derive(serde::Serialize)]
+pub struct ExtendedAttributes {
+    #[serde(rename = "Common")]
+    pub common: ExtendedAttributesCommon,
+}
+
+#[derive(serde::Serialize)]
+pub struct ExtendedAttributesCommon {
+    #[serde(rename = "Size")]
+    pub total_size: u64,
+    #[serde(rename = "ModificationTime")]
+    pub modification_time: String, // RFC 3339, matching typical Proton API date conventions elsewhere in this crate's design
+    #[serde(rename = "BlockSizes")]
+    pub block_sizes: Vec<u64>,
+    #[serde(rename = "Digests")]
+    pub digests: ExtendedAttributesDigests,
+}
+
+#[derive(serde::Serialize)]
+pub struct ExtendedAttributesDigests {
+    #[serde(rename = "SHA1")]
+    pub sha1_hex: String,
+}
+
+/// Builds the `XAttr` wire field: `attrs` serialized as JSON, then signed
+/// and PGP-encrypted to `node_key`'s own key pair in a single pass — an
+/// inline signature living inside the same SEIPD-encrypted message, not a
+/// detached signature alongside it — matching the reference SDKs'
+/// "encrypted+signed with the file's content key" note in the upload
+/// design doc (the file's *node* key, not its content key — the content
+/// key encrypts block data; the node key encrypts metadata like this and
+/// the content-key-packet itself).
+///
+/// This deliberately does not call `encrypt_to_key` (Task 5): that helper
+/// is encrypt-only, matching its actual callers (`NodePassphrase`, the
+/// content-key packet), which sign separately and encrypt *that* detached
+/// signature on its own — an earlier draft of this function reused that
+/// same shape (compute a detached signature, then `let _ = signature;`),
+/// which produced a blob that was encrypted but never actually signed.
+/// `XAttr` instead needs one message that is itself both signed and
+/// encrypted. The real fix, confirmed against the installed `pgp` 0.20.0
+/// source (`composed/message/builder.rs`): `Builder`/`MessageBuilder` has
+/// a `.sign(key, key_pw, hash_algorithm)` method implemented generically
+/// over any encryption state (`impl<'a, R, E: Encryption> Builder<'a, R, E>`),
+/// so it chains directly into the same `seipd_v1`/`encrypt_to_key` sequence
+/// `encrypt_to_key` already uses, instead of treating that function as an
+/// opaque helper. Internally, the builder signs the literal data first and
+/// only *then* encrypts the signed result (`to_writer_inner` feeds the
+/// signing generator into the encryption layer) — so the one signature
+/// lands inside the SEIPD container, recoverable only by decrypting, which
+/// is exactly what this module's own test does to prove it (decrypts the
+/// output and calls `.verify()` on it, rather than just checking that this
+/// function doesn't error).
+pub fn build_extended_attributes(attrs: &ExtendedAttributes, node_key: &NewNodeKey) -> Result<String> {
+    let json = serde_json::to_vec(attrs)
+        .map_err(|e| Error::Crypto(format!("failed to serialize extended attributes: {e}")))?;
+
+    let rng = rand08::rngs::OsRng;
+    let mut builder =
+        pgp::composed::MessageBuilder::from_bytes("", json).seipd_v1(rng, SymmetricKeyAlgorithm::AES256);
+    // The freshly generated node key's primary secret material is locked
+    // with `node_key.passphrase` at generation time (see `generate_node_key`)
+    // — the same fact `generate_content_key` already established
+    // empirically: signing with an empty password fails with "invalid
+    // input" rather than succeeding as if unprotected.
+    builder.sign(
+        &node_key.secret_key.primary_key,
+        Password::from(node_key.passphrase.as_str()),
+        HashAlgorithm::Sha256,
+    );
+
+    // Same "primary can't encrypt, use the subkey" fallback as `encrypt_to_key`.
+    let public_key = node_key.secret_key.to_public_key();
+    match public_key.public_subkeys.first() {
+        Some(subkey) => builder.encrypt_to_key(rng, subkey),
+        None => builder.encrypt_to_key(rng, &public_key),
+    }
+    .map_err(|e| Error::Crypto(format!("failed to encrypt extended attributes: {e}")))?;
+
+    builder
+        .to_armored_string(rng, Default::default())
+        .map_err(|e| Error::Crypto(format!("failed to sign and encrypt extended attributes: {e}")))
+}
+
+/// Computes the whole-file SHA-1 hex digest, streamed over `reader` in
+/// fixed-size chunks so the caller never needs the whole file in memory at
+/// once (the file itself may be much larger than a single 4 MiB block).
+pub fn compute_whole_file_sha1(mut reader: impl std::io::Read) -> Result<String> {
+    use sha1::{Digest as Sha1Digest, Sha1};
+    let mut hasher = Sha1::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut buf).map_err(Error::Io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,5 +810,94 @@ mod block_crypto_tests {
             .map(|(i, &b)| b ^ ciphertext.get(i).copied().unwrap_or(0))
             .collect();
         assert_eq!(recovered, verification_code);
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    // Duplicated from `block_crypto_tests::generate_test_parent` rather
+    // than imported via `use super::block_crypto_tests::generate_test_parent;`:
+    // that helper has no visibility modifier, so it's private to
+    // `block_crypto_tests` and visible only there and in its descendants —
+    // `manifest_tests` is a sibling, not a descendant, so Rust privacy
+    // rules block that path entirely (this is the same constraint
+    // `block_crypto_tests`'s own copy already documents; confirmed here by
+    // actually trying the `use` and hitting the privacy error). Duplicating
+    // this one small helper is preferable to introducing a shared test
+    // module for three call sites (YAGNI; revisit only if a fourth needs it).
+    fn generate_test_parent(passphrase: &str) -> UnlockedKey {
+        let mut key_params = SecretKeyParamsBuilder::default();
+        key_params
+            .key_type(KeyType::Rsa(2048))
+            .can_sign(true)
+            .primary_user_id("Parent <parent@example.com>".to_string())
+            .passphrase(Some(passphrase.to_string()));
+        let params = key_params.build().expect("valid key params");
+        let signed_secret_key = params.generate(rand08::rngs::OsRng).expect("key generation should succeed");
+        let armored = signed_secret_key.to_armored_string(Default::default()).unwrap();
+        UnlockedKey::new(&armored, passphrase.to_string()).unwrap()
+    }
+
+    #[test]
+    fn build_manifest_signature_produces_a_verifiable_signature() {
+        let signing_key = generate_test_parent("signing passphrase");
+        let hashes = [[1u8; 32], [2u8; 32]];
+        let signature_armored = build_manifest_signature(&hashes, &signing_key).unwrap();
+        assert!(signature_armored.contains("BEGIN PGP SIGNATURE"));
+    }
+
+    #[test]
+    fn compute_whole_file_sha1_matches_known_vector() {
+        // SHA-1 of the empty string is a well-known constant.
+        let digest = compute_whole_file_sha1(std::io::empty()).unwrap();
+        assert_eq!(digest, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    }
+
+    // Closes the gap flagged in `build_extended_attributes`'s own doc
+    // comment: an earlier draft computed a detached signature and threw it
+    // away, so the function "didn't error" while silently shipping an
+    // encrypted-but-unsigned blob. Checking `armored.contains("BEGIN PGP
+    // MESSAGE")` alone would not have caught that draft. This test instead
+    // decrypts the real output with the node key and calls `.verify()` on
+    // the decrypted message, which only succeeds if an inline signature
+    // genuinely exists inside the encrypted content.
+    #[test]
+    fn build_extended_attributes_round_trips_and_verifies() {
+        let parent = generate_test_parent("parent passphrase");
+        let address_signing_key = generate_test_parent("address passphrase");
+        let node_key = generate_node_key(&parent, &address_signing_key).unwrap();
+
+        let attrs = ExtendedAttributes {
+            common: ExtendedAttributesCommon {
+                total_size: 4_194_304,
+                modification_time: "2026-07-20T00:00:00Z".to_string(),
+                block_sizes: vec![4_194_304],
+                digests: ExtendedAttributesDigests {
+                    sha1_hex: "da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string(),
+                },
+            },
+        };
+
+        let armored = build_extended_attributes(&attrs, &node_key).unwrap();
+        assert!(armored.contains("BEGIN PGP MESSAGE"));
+
+        let (message, _headers) = Message::from_reader(armored.as_bytes()).unwrap();
+        let mut decrypted = message
+            .decrypt(&Password::from(node_key.passphrase.as_str()), &node_key.secret_key)
+            .expect("XAttr message should decrypt with the node key");
+
+        // Must actually read to the end before `verify()` — its own doc
+        // comment requires this ("the message must have been read to the
+        // end before calling this").
+        let plaintext = decrypted
+            .as_data_vec()
+            .expect("should be able to read the decrypted XAttr content");
+        assert_eq!(plaintext, serde_json::to_vec(&attrs).unwrap());
+
+        decrypted
+            .verify(node_key.secret_key.primary_key.public_key())
+            .expect("XAttr message's inline signature should verify against the node key's own public half");
     }
 }
