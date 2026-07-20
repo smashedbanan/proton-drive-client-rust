@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 const SERVICE: &str = "ch.proton.drive/drive-sdk-cli-rust";
 const ACCOUNT: &str = "session";
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
 pub struct Credentials {
     pub uid: String,
     pub access_token: String,
@@ -65,7 +65,10 @@ mod tests {
         };
         save(&creds).unwrap();
         let loaded = load().unwrap();
-        assert_eq!(loaded, creds);
+        assert_eq!(loaded.uid, creds.uid);
+        assert_eq!(loaded.access_token, creds.access_token);
+        assert_eq!(loaded.refresh_token, creds.refresh_token);
+        assert_eq!(loaded.user_key_password, creds.user_key_password);
 
         clear().unwrap();
         assert!(matches!(load(), Err(Error::NotLoggedIn)));

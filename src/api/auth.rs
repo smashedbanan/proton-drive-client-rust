@@ -49,7 +49,7 @@ pub struct AuthRequest<'a> {
     pub payload: HashMap<String, String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct AuthResponse {
     #[serde(rename = "UID")]
     pub uid: String,
@@ -85,7 +85,7 @@ pub fn fetch_key_salts(client: &ApiClient) -> Result<KeySaltsResponse> {
     client.get("core/v4/keys/salts")
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct UserKey {
     #[serde(rename = "ID")]
     pub id: String,
@@ -97,13 +97,13 @@ pub struct UserKey {
     pub active: i64,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct UserObj {
     #[serde(rename = "Keys")]
     pub keys: Vec<UserKey>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct UsersResponse {
     #[serde(rename = "User")]
     pub user: UserObj,
