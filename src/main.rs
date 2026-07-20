@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod crypto;
 mod error;
+mod session;
 mod srp;
 
 use clap::Parser;
