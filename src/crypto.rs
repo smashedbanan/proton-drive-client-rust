@@ -1,15 +1,17 @@
 use crate::error::{Error, Result};
 use base64::Engine;
 use pgp::composed::{
-    Deserializable, EncryptionCaps, KeyType, Message, SecretKeyParamsBuilder, SignedSecretKey,
+    Deserializable, EncryptionCaps, KeyType, Message, PlainSessionKey, SecretKeyParamsBuilder, SignedSecretKey,
     SubkeyParamsBuilder,
 };
+use pgp::crypto::aead::{AeadAlgorithm, ChunkSize};
 use pgp::crypto::ecc_curve::ECCCurve;
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::ser::Serialize;
 use pgp::types::Password;
 use rand::Rng;
+use sha2::{Digest, Sha256};
 
 /// Attempts to unlock an armored OpenPGP private key with the given
 /// passphrase, discarding the result. Used purely to validate that a
@@ -271,6 +273,134 @@ pub fn generate_content_key(node_key: &NewNodeKey) -> Result<ContentKeyPacket> {
     })
 }
 
+pub struct EncryptedBlock {
+    pub ciphertext: Vec<u8>,
+    pub sha256_hash: [u8; 32],
+    /// wire field `EncSignature` — a detached signature over the
+    /// plaintext, PGP-encrypted to the node's own key. Uploaded as block
+    /// metadata but never verified client-side at upload time (it exists
+    /// for later, download-side verification, out of scope here) — see
+    /// the upload design doc.
+    pub encrypted_signature_armored: String,
+}
+
+/// Encrypts one block's plaintext under `content_key`, choosing SEIPDv1 or
+/// SEIPDv2/AEAD framing per `aead` (resolved once by the caller from the
+/// `DriveCryptoEncryptBlocksWithPgpAead` feature flag — see
+/// `commands::upload`, Task 11 — not re-checked per block), signs the
+/// plaintext with `signing_key` (the address signing key), and encrypts
+/// that detached signature to the node's own key. Retrying on integrity
+/// mismatch is the caller's responsibility (`commands::upload`, Task 11)
+/// via `decrypt_block_with_session_key` below.
+///
+/// `seipd_v1`/`seipd_v2` return the builder directly (they can't fail), but
+/// `set_session_key` takes `&mut self` and returns `Result<&mut Self>` while
+/// `to_vec` needs to consume the builder by value — so, same as
+/// `encrypt_to_key` above, this needs a `let mut builder` plus separate
+/// statements rather than one chained expression.
+pub fn encrypt_and_sign_block(
+    plaintext: &[u8],
+    content_key: &ContentKeyPacket,
+    signing_key: &UnlockedKey,
+    node_key_for_signature_encryption: &NewNodeKey,
+    aead: bool,
+) -> Result<EncryptedBlock> {
+    let rng = rand08::rngs::OsRng;
+    let ciphertext = if aead {
+        // Chunk size is a framing parameter the decrypting side reads back
+        // out of the message itself — it doesn't need to match Proton's own
+        // 128 KiB default (`PgpDefaults.AeadStreamingChunkLength`, found
+        // during research) for correctness, only for parity with it, so
+        // the crate's default is used here rather than hand-picking a
+        // `ChunkSize` variant that wasn't independently confirmed to exist
+        // under an exact name. `AeadAlgorithm::Ocb` is RFC 9580's own
+        // default AEAD mode for SEIPDv2 — a reasonable, standard choice,
+        // not independently confirmed as Proton's specific pick (the
+        // library that would confirm it, `Proton.Cryptography.Pgp`, isn't
+        // vendored in the reference SDK — see the upload design doc).
+        let mut builder = pgp::composed::MessageBuilder::from_bytes("", plaintext.to_vec()).seipd_v2(
+            rng,
+            SymmetricKeyAlgorithm::AES256,
+            AeadAlgorithm::Ocb,
+            ChunkSize::default(),
+        );
+        builder
+            .set_session_key(content_key.content_key.clone())
+            .map_err(|e| Error::Crypto(format!("failed to set block session key: {e}")))?;
+        builder
+            .to_vec(rng)
+            .map_err(|e| Error::Crypto(format!("failed to encrypt block: {e}")))?
+    } else {
+        let mut builder = pgp::composed::MessageBuilder::from_bytes("", plaintext.to_vec())
+            .seipd_v1(rng, SymmetricKeyAlgorithm::AES256);
+        builder
+            .set_session_key(content_key.content_key.clone())
+            .map_err(|e| Error::Crypto(format!("failed to set block session key: {e}")))?;
+        builder
+            .to_vec(rng)
+            .map_err(|e| Error::Crypto(format!("failed to encrypt block: {e}")))?
+    };
+
+    let sha256_hash: [u8; 32] = Sha256::digest(&ciphertext).into();
+
+    let signature_armored = sign_detached(plaintext, signing_key)?;
+    let encrypted_signature_armored = encrypt_to_key(
+        signature_armored.as_bytes(),
+        &UnlockedKey {
+            secret_key: node_key_for_signature_encryption.secret_key.clone(),
+            passphrase: String::new(), // node key is used here only for its public half (encryption), never unlocked
+        },
+    )?;
+
+    Ok(EncryptedBlock {
+        ciphertext,
+        sha256_hash,
+        encrypted_signature_armored,
+    })
+}
+
+/// Decrypts `ciphertext` with the already-known `content_key` — used to
+/// verify a block was encrypted correctly before uploading it (retry once
+/// on mismatch, per the upload design's data flow), never for downloading
+/// someone else's content. `aead` must match whatever `encrypt_and_sign_block`
+/// was called with to produce `ciphertext` — a v6 session key only pairs
+/// with a v2/AEAD SEIPD message and vice versa (confirmed during research:
+/// `PlainSessionKey::V6`'s own doc comment states this pairing explicitly).
+///
+/// `Message::from_reader` (not `from_string`/`from_armor_single`) is used
+/// deliberately: `ciphertext` is raw binary (the output of `to_vec` above),
+/// not armored text, and `from_reader`'s own doc comment confirms it
+/// transparently handles either.
+pub fn decrypt_block_with_session_key(ciphertext: &[u8], content_key: &ContentKeyPacket, aead: bool) -> Result<Vec<u8>> {
+    let (message, _headers) = Message::from_reader(ciphertext)
+        .map_err(|e| Error::Crypto(format!("bad block ciphertext: {e}")))?;
+    let plain_session_key = if aead {
+        PlainSessionKey::V6 { key: content_key.content_key.clone() }
+    } else {
+        PlainSessionKey::V3_4 {
+            sym_alg: SymmetricKeyAlgorithm::AES256,
+            key: content_key.content_key.clone(),
+        }
+    };
+    let mut decrypted = message
+        .decrypt_with_session_key(plain_session_key)
+        .map_err(|e| Error::Crypto(format!("block failed integrity check: {e}")))?;
+    decrypted
+        .as_data_vec()
+        .map_err(|e| Error::Crypto(format!("failed to read decrypted block: {e}")))
+}
+
+/// The block-upload registration payload's `Verifier.Token`: `verification_code`
+/// XOR'd against a same-length prefix of `ciphertext` (per the reference
+/// SDKs — a tamper-binding value, not a hash).
+pub fn compute_verification_token(ciphertext: &[u8], verification_code: &[u8]) -> Vec<u8> {
+    verification_code
+        .iter()
+        .enumerate()
+        .map(|(i, &code_byte)| code_byte ^ ciphertext.get(i).copied().unwrap_or(0))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,5 +606,88 @@ mod content_key_tests {
             panic!("expected a v3/v4 plain session key");
         };
         assert_eq!(key.as_ref(), content_key_packet.content_key.as_ref());
+    }
+}
+
+#[cfg(test)]
+mod block_crypto_tests {
+    use super::*;
+
+    // Duplicated from `content_key_tests::generate_test_parent` rather than
+    // shared: that helper is private to its own (sibling) test module, and
+    // Rust privacy doesn't let a sibling module reach into it — duplicating
+    // this one small helper is preferable to introducing a shared test
+    // module for two call sites (YAGNI; revisit only if a third test module
+    // needs it).
+    fn generate_test_parent(passphrase: &str) -> UnlockedKey {
+        let mut key_params = SecretKeyParamsBuilder::default();
+        key_params
+            .key_type(KeyType::Rsa(2048))
+            .can_sign(true)
+            .primary_user_id("Parent <parent@example.com>".to_string())
+            .passphrase(Some(passphrase.to_string()));
+        let params = key_params.build().expect("valid key params");
+        let signed_secret_key = params.generate(rand08::rngs::OsRng).expect("key generation should succeed");
+        let armored = signed_secret_key.to_armored_string(Default::default()).unwrap();
+        UnlockedKey::new(&armored, passphrase.to_string()).unwrap()
+    }
+
+    #[test]
+    fn encrypt_and_sign_block_round_trips() {
+        let parent = generate_test_parent("parent passphrase");
+        let address_signing_key = generate_test_parent("address passphrase");
+        let node_key = generate_node_key(&parent, &address_signing_key).unwrap();
+        let content_key = generate_content_key(&node_key).unwrap();
+
+        let plaintext = b"pretend this is up to 4 MiB of file content";
+
+        for aead in [false, true] {
+            let block = encrypt_and_sign_block(plaintext, &content_key, &address_signing_key, &node_key, aead).unwrap();
+
+            let decrypted = decrypt_block_with_session_key(&block.ciphertext, &content_key, aead).unwrap();
+            assert_eq!(decrypted, plaintext, "aead={aead}");
+
+            let expected_hash: [u8; 32] = Sha256::digest(&block.ciphertext).into();
+            assert_eq!(block.sha256_hash, expected_hash, "aead={aead}");
+        }
+    }
+
+    // `encrypt_and_sign_block_round_trips` above loops over both `aead`
+    // values but always calls `decrypt_block_with_session_key` with the
+    // *matching* flag — that alone wouldn't catch a bug where `aead` was
+    // silently ignored and both branches took the same code path. This
+    // proves the two framings are genuinely distinct and mutually
+    // incompatible, matching `PlainSessionKey::V6`'s own doc comment (a v6
+    // session key only pairs with a v2/AEAD SEIPD message and vice versa).
+    #[test]
+    fn mismatched_aead_flag_fails_to_decrypt() {
+        let parent = generate_test_parent("parent passphrase");
+        let address_signing_key = generate_test_parent("address passphrase");
+        let node_key = generate_node_key(&parent, &address_signing_key).unwrap();
+        let content_key = generate_content_key(&node_key).unwrap();
+        let plaintext = b"pretend this is up to 4 MiB of file content";
+
+        for aead in [false, true] {
+            let block = encrypt_and_sign_block(plaintext, &content_key, &address_signing_key, &node_key, aead).unwrap();
+            assert!(
+                decrypt_block_with_session_key(&block.ciphertext, &content_key, !aead).is_err(),
+                "decrypting aead={aead} ciphertext with aead={} should fail",
+                !aead
+            );
+        }
+    }
+
+    #[test]
+    fn verification_token_is_reversible_xor() {
+        let ciphertext = b"some ciphertext bytes here";
+        let verification_code = b"a-verification-code-32-bytes!!!";
+        let token = compute_verification_token(ciphertext, verification_code);
+        // XOR-ing the token against the same ciphertext prefix recovers the code.
+        let recovered: Vec<u8> = token
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| b ^ ciphertext.get(i).copied().unwrap_or(0))
+            .collect();
+        assert_eq!(recovered, verification_code);
     }
 }
