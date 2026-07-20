@@ -18,7 +18,7 @@ use crate::session;
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{Read, Seek};
+use std::io::Read;
 use std::path::Path;
 
 const SMALL_FILE_UPLOAD_FLAG: &str = "DriveSmallFileUpload";
@@ -235,8 +235,11 @@ fn upload_general(ctx: &UploadContext, file: &mut File) -> Result<String> {
             }
         };
 
+    use sha1::{Digest as Sha1Digest, Sha1};
+
     let mut block_hashes = Vec::new();
     let mut block_sizes = Vec::new();
+    let mut sha1_hasher = Sha1::new();
     let mut buf = vec![0u8; BLOCK_SIZE_BYTES];
     let mut block_index: i64 = 1;
     loop {
@@ -245,6 +248,7 @@ fn upload_general(ctx: &UploadContext, file: &mut File) -> Result<String> {
             break;
         }
         let plaintext = &buf[..n];
+        sha1_hasher.update(plaintext);
         let encrypted_block = encrypt_verified_block(ctx, &node_key_for_blocks, &content_key_for_blocks, plaintext)?;
 
         let verification = get_verification_input(ctx.client, &ctx.folder.volume_id, &link_id, &revision_id)?;
@@ -280,8 +284,10 @@ fn upload_general(ctx: &UploadContext, file: &mut File) -> Result<String> {
         block_index += 1;
     }
 
+    let sha1_hex: String = sha1_hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let total_size = block_sizes.iter().sum::<u64>();
     let manifest_signature = build_manifest_signature(&block_hashes, ctx.address_key)?;
-    let xattr_armored = build_xattr(file, ctx.file_size, block_sizes, &node_key_for_blocks)?;
+    let xattr_armored = build_xattr(file, total_size, block_sizes, sha1_hex, &node_key_for_blocks)?;
 
     let commit_req = RevisionUpdateRequest {
         manifest_signature: &manifest_signature,
@@ -306,11 +312,13 @@ fn upload_general(ctx: &UploadContext, file: &mut File) -> Result<String> {
 fn upload_small(ctx: &UploadContext, file: &mut File) -> Result<String> {
     let mut plaintext = Vec::with_capacity(ctx.file_size as usize);
     file.read_to_end(&mut plaintext).map_err(Error::Io)?;
+    let total_size = plaintext.len() as u64;
+    let sha1_hex = compute_whole_file_sha1(plaintext.as_slice())?;
 
     let node_key = ctx.new_node_key.as_unlocked_key();
     let encrypted_block = encrypt_verified_block(ctx, &node_key, ctx.content_key, &plaintext)?;
     let manifest_signature = build_manifest_signature(&[encrypted_block.sha256_hash], ctx.address_key)?;
-    let xattr_armored = build_xattr(file, ctx.file_size, vec![plaintext.len() as u64], &node_key)?;
+    let xattr_armored = build_xattr(file, total_size, vec![total_size], sha1_hex.clone(), &node_key)?;
 
     let new_file_metadata = SmallFileUploadMetadata {
         name: ctx.encrypted_name,
@@ -350,7 +358,7 @@ fn upload_small(ctx: &UploadContext, file: &mut File) -> Result<String> {
                 resolve_existing_node_key_and_content_key(ctx, &existing_link_id)?;
             let encrypted_block = encrypt_verified_block(ctx, &existing_node_key, &existing_content_key, &plaintext)?;
             let manifest_signature = build_manifest_signature(&[encrypted_block.sha256_hash], ctx.address_key)?;
-            let xattr_armored = build_xattr(file, ctx.file_size, vec![plaintext.len() as u64], &existing_node_key)?;
+            let xattr_armored = build_xattr(file, total_size, vec![total_size], sha1_hex, &existing_node_key)?;
 
             let revision_metadata = SmallRevisionUploadMetadata {
                 signature_email_address: &ctx.address.email,
@@ -371,9 +379,11 @@ fn upload_small(ctx: &UploadContext, file: &mut File) -> Result<String> {
 }
 
 /// Builds the `XAttr` wire value shared by both upload paths: total size,
-/// modification time, per-block plaintext sizes, and the whole-file SHA-1
-/// (computed by rewinding `file` and re-reading it — the block loop /
-/// whole-file read above already consumed it once, for encryption).
+/// modification time, per-block plaintext sizes, and the whole-file SHA-1.
+/// `total_size`/`sha1_hex` are passed in already computed by the caller from
+/// the bytes actually encrypted (the block loop / whole-file read above),
+/// not re-read from `file` here — `file` is only used for its `.metadata()`
+/// (the mtime).
 ///
 /// `modification_time` is rendered as a real RFC 3339 timestamp via
 /// `humantime::format_rfc3339_seconds`, matching
@@ -389,14 +399,18 @@ fn upload_small(ctx: &UploadContext, file: &mut File) -> Result<String> {
 /// 1965-01-01`) — `humantime::Rfc3339Timestamp`'s `Display` impl panics
 /// (`.duration_since(UNIX_EPOCH).expect(...)`) on a pre-epoch value rather
 /// than erroring, so this must never hand it one.
-fn build_xattr(file: &mut File, file_size: u64, block_sizes: Vec<u64>, node_key: &UnlockedKey) -> Result<String> {
-    file.rewind().map_err(Error::Io)?;
-    let sha1_hex = compute_whole_file_sha1(&mut *file)?;
+fn build_xattr(
+    file: &File,
+    total_size: u64,
+    block_sizes: Vec<u64>,
+    sha1_hex: String,
+    node_key: &UnlockedKey,
+) -> Result<String> {
     let modified = file.metadata().map_err(Error::Io)?.modified().unwrap_or(std::time::UNIX_EPOCH);
     let modification_time = humantime::format_rfc3339_seconds(clamp_to_unix_epoch(modified)).to_string();
     let extended_attributes = ExtendedAttributes {
         common: ExtendedAttributesCommon {
-            total_size: file_size,
+            total_size,
             modification_time,
             block_sizes,
             digests: ExtendedAttributesDigests { sha1_hex },
@@ -435,5 +449,34 @@ mod xattr_tests {
 
         let formatted = humantime::format_rfc3339_seconds(clamp_to_unix_epoch(pre_epoch)).to_string();
         assert_eq!(formatted, "1970-01-01T00:00:00Z");
+    }
+
+    // Regression guard for `upload_general`'s chunked SHA-1 accumulation
+    // fix: feeding sequential chunks through repeated `.update()` calls on
+    // one `Sha1` hasher must produce the same digest as hashing the
+    // concatenation of those chunks in a single pass. This is the exact
+    // property the block loop's fix relies on (accumulating over the same
+    // `plaintext` chunks handed to encryption, instead of re-reading the
+    // whole file from disk afterward) — `upload_general` itself isn't
+    // unit-testable (no `ApiClient` mock seam), so this tests the hashing
+    // property directly.
+    #[test]
+    fn chunked_sha1_accumulation_matches_whole_buffer_hash() {
+        use sha1::{Digest as Sha1Digest, Sha1};
+
+        let whole = b"the quick brown fox jumps over the lazy dog";
+        let a = whole.len() / 3;
+        let b = 2 * whole.len() / 3;
+        let chunks: [&[u8]; 3] = [&whole[..a], &whole[a..b], &whole[b..]];
+
+        let mut hasher = Sha1::new();
+        for chunk in chunks {
+            hasher.update(chunk);
+        }
+        let chunked_hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+
+        let whole_hex = compute_whole_file_sha1(&whole[..]).unwrap();
+
+        assert_eq!(chunked_hex, whole_hex);
     }
 }
