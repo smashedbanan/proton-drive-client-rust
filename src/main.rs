@@ -1,5 +1,6 @@
 mod cli;
 mod error;
+mod srp;
 
 use clap::Parser;
 use cli::{Cli, Command};
