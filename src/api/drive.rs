@@ -565,14 +565,29 @@ pub fn prepare_block_upload(
 /// normal session bearer token) as `multipart/form-data` with one part
 /// named `Block`. Bypasses `ApiClient::post` entirely since this targets an
 /// opaque runtime URL outside the API base, with different auth.
+///
+/// The shared `agent` has `http_status_as_error(false)` set (needed so
+/// `ApiClient`'s own calls can read Proton's JSON `Code` envelope on error
+/// responses — see `api::parse_response`), so a non-2xx status here comes
+/// back as `Ok`, not `Err`; the storage host is a different, opaque server
+/// that isn't guaranteed to return that envelope shape at all, so the
+/// status is checked directly rather than routed through `parse_response`.
+/// Without this check a failed upload (expired signed URL, storage-side
+/// error) would be silently treated as success.
 pub fn upload_block_bytes(agent: &ureq::Agent, target: &BlockUploadTarget, ciphertext: &[u8]) -> Result<()> {
     let form = Form::new().part("Block", Part::bytes(ciphertext));
-    agent
+    let response = agent
         .post(&target.bare_url)
         .header("x-pm-appversion", APP_VERSION)
         .header("pm-storage-token", &target.token)
         .send(form)
         .map_err(|e| Error::Network(e.to_string()))?;
+    if !response.status().is_success() {
+        return Err(Error::Network(format!(
+            "block upload failed: storage host returned HTTP {}",
+            response.status()
+        )));
+    }
     Ok(())
 }
 
