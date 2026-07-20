@@ -445,6 +445,15 @@ mod content_key_tests {
             .first()
             .expect("node key has a secret encryption subkey")
             .key;
+        // Regression guard for the bug fixed in ae96368: `SecretSubkey::decrypt`
+        // (called below) ignores whatever `Password` it's given when the
+        // secret material is still `SecretParams::Plain` (unencrypted) — it
+        // only checks the password once the key is genuinely `Encrypted`. So
+        // if `.passphrase(Some(passphrase.clone()))` were ever dropped again
+        // from the `encryption_subkey` builder in `generate_node_key`, the
+        // decrypt-and-compare assertions below would keep passing unchanged.
+        // This checks the actual lock state directly, independent of that.
+        assert!(secret_subkey.secret_params().is_encrypted());
         // The encryption subkey is locked with the same freshly-generated
         // passphrase as the primary key (see `generate_node_key`), so it
         // must be unlocked with that real passphrase, not an empty one.
