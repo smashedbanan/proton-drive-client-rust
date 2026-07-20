@@ -1,4 +1,38 @@
+use crate::error::{Error, Result};
+use base64::Engine;
+use num_bigint::BigUint;
+use pgp::composed::{CleartextSignedMessage, Deserializable, SignedPublicKey};
 use sha2::{Digest, Sha512};
+
+/// Modulus is always exactly 2048 bits.
+pub const MODULUS_BYTE_LEN: usize = 256;
+
+/// Proton's hardcoded public key (`proton@srp.modulus`) used to sign every
+/// server-issued SRP modulus. This is not a placeholder — it is the real,
+/// publicly-known key from Proton's own open-source SRP clients (go-srp),
+/// used to verify the modulus hasn't been tampered with in transit.
+const MODULUS_PUBKEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\r\n\r\nxjMEXAHLgxYJKwYBBAHaRw8BAQdAFurWXXwjTemqjD7CXjXVyKf0of7n9Ctm\r\nL8v9enkzggHNEnByb3RvbkBzcnAubW9kdWx1c8J3BBAWCgApBQJcAcuDBgsJ\r\nBwgDAgkQNQWFxOlRjyYEFQgKAgMWAgECGQECGwMCHgEAAPGRAP9sauJsW12U\r\nMnTQUZpsbJb53d0Wv55mZIIiJL2XulpWPQD/V6NglBd96lZKBmInSXX/kXat\r\nSv+y0io+LR8i2+jV+AbOOARcAcuDEgorBgEEAZdVAQUBAQdAeJHUz1c9+KfE\r\nkSIgcBRE3WuXC4oj5a2/U3oASExGDW4DAQgHwmEEGBYIABMFAlwBy4MJEDUF\r\nhcTpUY8mAhsMAAD/XQD8DxNI6E78meodQI+wLsrKLeHn32iLvUqJbVDhfWSU\r\nWO4BAMcm1u02t4VKw++ttECPt+HUgPUq5pqQWe5Q2cW4TMsE\r\n=Y4Mw\r\n-----END PGP PUBLIC KEY BLOCK-----";
+
+/// Verifies the cleartext-signed modulus message against Proton's hardcoded
+/// signing key and returns the decoded modulus as a little-endian BigUint.
+///
+/// The modulus wire format is little-endian — confirmed during planning by
+/// checking N mod 8 == 3 (the property Proton's own native client checks to
+/// validate a safe prime): the big-endian interpretation of a real captured
+/// modulus is not even prime, the little-endian one is, with N mod 8 == 3.
+pub fn verify_and_decode_modulus(clearsigned: &str) -> Result<BigUint> {
+    let (public_key, _headers) = SignedPublicKey::from_string(MODULUS_PUBKEY)
+        .map_err(|e| Error::Crypto(format!("bad hardcoded modulus pubkey: {e}")))?;
+    let (msg, _headers) = CleartextSignedMessage::from_string(clearsigned)
+        .map_err(|e| Error::Crypto(format!("bad modulus message: {e}")))?;
+    msg.verify(&public_key)
+        .map_err(|e| Error::Crypto(format!("modulus signature invalid: {e}")))?;
+    let cleartext = msg.signed_text();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(cleartext.trim())
+        .map_err(|e| Error::Crypto(format!("bad modulus base64: {e}")))?;
+    Ok(BigUint::from_bytes_le(&bytes))
+}
 
 /// Proton's SRP hash primitive: four SHA-512 hashes of `data` suffixed with
 /// 0x00..0x03, concatenated — 256 bytes total, sized to match the 2048-bit
@@ -36,5 +70,27 @@ mod tests {
                 .collect();
             assert_eq!(&chunk_hex, exp_hex, "chunk {i} mismatch");
         }
+    }
+}
+
+#[cfg(test)]
+mod modulus_tests {
+    use super::*;
+
+    const TEST_MODULUS_CLEARSIGN: &str = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nW2z5HBi8RvsfYzZTS7qBaUxxPhsfHJFZpu3Kd6s1JafNrCCH9rfvPLrfuqocxWPgWDH2R8neK7PkNvjxto9TStuY5z7jAzWRvFWN9cQhAKkdWgy0JY6ywVn22+HFpF4cYesHrqFIKUPDMSSIlWjBVmEJZ/MusD44ZT29xcPrOqeZvwtCffKtGAIjLYPZIEbZKnDM1Dm3q2K/xS5h+xdhjnndhsrkwm9U9oyA2wxzSXFL+pdfj2fOdRwuR5nW0J2NFrq3kJjkRmpO/Genq1UW+TEknIWAb6VzJJJA244K/H8cnSx2+nSNZO3bbo6Ys228ruV9A8m6DhxmS+bihN3ttQ==\n-----BEGIN PGP SIGNATURE-----\nVersion: ProtonMail\nComment: https://protonmail.com\n\nwl4EARYIABAFAlwB1j0JEDUFhcTpUY8mAAD8CgEAnsFnF4cF0uSHKkXa1GIa\nGO86yMV4zDZEZcDSJo0fgr8A/AlupGN9EdHlsrZLmTA1vhIx+rOgxdEff28N\nkvNM7qIK\n=q6vu\n-----END PGP SIGNATURE-----";
+
+    #[test]
+    fn verifies_and_decodes_real_fixture() {
+        let n = verify_and_decode_modulus(TEST_MODULUS_CLEARSIGN).unwrap();
+        assert_eq!(n.to_bytes_le().len(), MODULUS_BYTE_LEN.min(n.to_bytes_le().len()).max(255));
+        assert_eq!(&n % 8u32, BigUint::from(3u32), "N mod 8 must be 3 for a valid safe prime");
+    }
+
+    #[test]
+    fn rejects_tampered_signature() {
+        let mut tampered = TEST_MODULUS_CLEARSIGN.to_string();
+        let last = tampered.len();
+        tampered.replace_range(last - 60..last - 59, "9");
+        assert!(verify_and_decode_modulus(&tampered).is_err());
     }
 }
