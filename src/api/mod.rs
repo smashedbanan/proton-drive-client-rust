@@ -2,6 +2,7 @@ use crate::config::{API_BASE_URL, APP_VERSION};
 use crate::error::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use ureq::unversioned::multipart::Form;
 
 pub mod account;
 pub mod auth;
@@ -17,6 +18,8 @@ struct Envelope {
     code: i64,
     #[serde(rename = "Error")]
     error: Option<String>,
+    #[serde(rename = "Details")]
+    details: Option<serde_json::Value>,
 }
 
 const SUCCESS_CODE: i64 = 1000;
@@ -76,6 +79,26 @@ impl ApiClient {
             .map_err(|e| Error::Network(e.to_string()))?;
         parse_response(response)
     }
+
+    /// Same shape as `post` above (headers, session auth), but sends a
+    /// multipart body instead of JSON — used only by the small-file upload
+    /// path (`api::drive::upload_small_file`/`upload_small_revision`), which
+    /// is a regular authenticated API call (unlike the block-upload storage
+    /// host, which uses a distinct `pm-storage-token` and no session header).
+    pub fn post_multipart<Resp: DeserializeOwned>(&self, path: &str, form: Form<'_>) -> Result<Resp> {
+        let url = format!("{API_BASE_URL}/{path}");
+        let req = self.agent.post(&url).header("x-pm-appversion", APP_VERSION);
+        let req = if let Some((uid, token)) = &self.session {
+            req.header("x-pm-uid", uid)
+                .header("Authorization", &format!("Bearer {token}"))
+        } else {
+            req
+        };
+        let response = req
+            .send(form)
+            .map_err(|e| Error::Network(e.to_string()))?;
+        parse_response(response)
+    }
 }
 
 fn parse_response<Resp: DeserializeOwned>(mut response: ureq::http::Response<ureq::Body>) -> Result<Resp> {
@@ -89,6 +112,7 @@ fn parse_response<Resp: DeserializeOwned>(mut response: ureq::http::Response<ure
         return Err(Error::Api {
             code: envelope.code,
             message: envelope.error.unwrap_or_else(|| "unknown API error".into()),
+            details: envelope.details,
         });
     }
     serde_json::from_str(&text).map_err(|e| Error::Network(format!("failed to parse response body: {e}")))

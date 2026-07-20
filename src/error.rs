@@ -3,7 +3,11 @@ pub enum Error {
     #[error("network error: {0}")]
     Network(String),
     #[error("API error {code}: {message}")]
-    Api { code: i64, message: String },
+    Api {
+        code: i64,
+        message: String,
+        details: Option<serde_json::Value>,
+    },
     #[error("crypto error: {0}")]
     Crypto(String),
     #[error("this account uses two-password mode, which this client does not support yet")]
