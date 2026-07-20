@@ -11,6 +11,10 @@ pub struct Cli {
 pub enum Command {
     Login,
     Logout,
+    Upload {
+        local: String,
+        remote: String,
+    },
 }
 
 #[cfg(test)]
@@ -32,5 +36,14 @@ mod tests {
     #[test]
     fn rejects_unknown_command() {
         assert!(Cli::try_parse_from(["proton-drive", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn parses_upload_with_local_and_remote_args() {
+        let cli = Cli::try_parse_from(["proton-drive", "upload", "./file.txt", "/my-files/docs"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Upload { local: "./file.txt".to_string(), remote: "/my-files/docs".to_string() }
+        );
     }
 }

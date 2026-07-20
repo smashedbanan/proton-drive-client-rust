@@ -16,6 +16,7 @@ fn main() {
     let result = match cli.command {
         Command::Login => commands::login::run(),
         Command::Logout => commands::logout::run(),
+        Command::Upload { local, remote } => commands::upload::run(&local, &remote),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
