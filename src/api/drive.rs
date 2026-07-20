@@ -22,6 +22,15 @@ pub struct Share {
     pub membership_address_id: String,
 }
 
+// No `Debug` — holds a content-key packet, key material by another name.
+#[derive(Deserialize)]
+pub struct LinkFileDetails {
+    #[serde(rename = "ContentKeyPacket")]
+    pub content_key_packet: String,
+    #[serde(rename = "ContentKeyPacketSignature")]
+    pub content_key_packet_signature: String,
+}
+
 /// The subset of a link's details needed to decrypt its name and descend
 /// into it. `node_passphrase`/`node_key` are absent for a link this account
 /// only has read access to via a different key chain — not a case we need
@@ -36,6 +45,9 @@ pub struct LinkDetails {
     pub node_key: String,
     #[serde(rename = "NodePassphrase")]
     pub node_passphrase: String,
+    /// File-type links only (`Link.File.*` on the wire); absent for folders.
+    #[serde(rename = "File")]
+    pub file: Option<LinkFileDetails>,
 }
 
 #[derive(Deserialize)]
@@ -374,6 +386,18 @@ mod shape_tests {
         let parsed: LinkDetailsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.links.len(), 1);
         assert_eq!(parsed.links[0].link_id, "l1");
+        assert!(parsed.links[0].file.is_none());
+    }
+
+    #[test]
+    fn link_details_deserializes_file_content_key_fields_when_present() {
+        let json = r#"{"Links": [
+            {"LinkID": "l1", "Name": "n", "NodeKey": "k", "NodePassphrase": "p",
+             "File": {"ContentKeyPacket": "cpk-b64", "ContentKeyPacketSignature": "armored-sig"}}
+        ]}"#;
+        let parsed: LinkDetailsResponse = serde_json::from_str(json).unwrap();
+        let file = parsed.links[0].file.as_ref().expect("file field should be present");
+        assert_eq!(file.content_key_packet, "cpk-b64");
     }
 
     #[test]

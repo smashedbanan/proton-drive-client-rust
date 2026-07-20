@@ -8,8 +8,9 @@ use pgp::crypto::aead::{AeadAlgorithm, ChunkSize};
 use pgp::crypto::ecc_curve::ECCCurve;
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
+use pgp::packet::{Packet, PacketParser};
 use pgp::ser::Serialize;
-use pgp::types::Password;
+use pgp::types::{DecryptionKey, EskType, Password};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 
@@ -270,6 +271,99 @@ pub fn generate_content_key(node_key: &NewNodeKey) -> Result<ContentKeyPacket> {
         content_key,
         packet_b64,
         packet_signature_armored,
+    })
+}
+
+/// Decrypts an EXISTING file's content-key packet (base64, fetched from the
+/// server via `api::drive::get_link_details`'s `LinkFileDetails.content_key_packet`
+/// field) back to its raw session key, using the file's own node key —
+/// already unlocked the same way every other node key in this crate is:
+/// decrypt its `NodePassphrase` with the parent folder's key, then
+/// `UnlockedKey::new`. Used when uploading a new revision to an existing
+/// file: the content key is per-file, generated once, and MUST be reused
+/// across every revision (see `generate_content_key`'s own doc comment) —
+/// never regenerated.
+///
+/// Unlike `generate_content_key`'s own `packet_b64` (this crate's headerless
+/// internal shortcut for its OWN generated packets — see that function's
+/// doc comment — explicitly not meant to be re-parsed), a real Proton
+/// server's stored `ContentKeyPacket` is produced by official clients using
+/// standard OpenPGP libraries: a properly-framed, standalone OpenPGP packet
+/// (header + body), parsed here via `PacketParser` — a fundamentally
+/// different parse path from this crate's own internal convention. **Not
+/// independently verified against a real Proton-server-produced value** (no
+/// live account was available while writing this) — flagged for live
+/// confirmation during Task 14's manual verification, same treatment as
+/// every other not-yet-live-tested protocol detail in this plan.
+///
+/// The returned `ContentKeyPacket.packet_b64`/`packet_signature_armored`
+/// are empty placeholders, not real values. Reusing an existing content key
+/// never re-sends it to the server — `RevisionCreationRequest`/
+/// `SmallRevisionUploadMetadata` (Task 6) carry no content-key fields at
+/// all — so only `.content_key` (the raw session key) is ever read by
+/// `encrypt_and_sign_block`/`decrypt_block_with_session_key` (Task 7), the
+/// only two functions that consume a `ContentKeyPacket` for block crypto.
+pub fn decrypt_existing_content_key(content_key_packet_b64: &str, node_key: &UnlockedKey) -> Result<ContentKeyPacket> {
+    let packet_bytes = base64::engine::general_purpose::STANDARD
+        .decode(content_key_packet_b64)
+        .map_err(|e| Error::Crypto(format!("bad content key packet base64: {e}")))?;
+    let mut parser = PacketParser::new(&packet_bytes[..]);
+    let packet = parser
+        .next()
+        .ok_or_else(|| Error::Crypto("content key packet is empty".into()))?
+        .map_err(|e| Error::Crypto(format!("failed to parse content key packet: {e}")))?;
+    let pkesk = match packet {
+        Packet::PublicKeyEncryptedSessionKey(pkesk) => pkesk,
+        other => return Err(Error::Crypto(format!("expected a content-key packet, got {other:?}"))),
+    };
+    // `esk_type` distinguishes the two PKESK wire versions (V3 pairs with
+    // SEIPDv1, V6 with SEIPDv2/AEAD). Confirmed against the installed `pgp`
+    // 0.20.0 source (`src/packet/public_key_encrypted_session_key.rs`): the
+    // variant names are `V3 { .. }`/`V6 { .. }` as guessed, but the enum
+    // also has a third `Other { .. }` variant (any PKESK version besides 3
+    // or 6), so a two-arm match on just `V3`/`V6` is non-exhaustive and
+    // doesn't compile — this catch-all arm is required, not optional.
+    let esk_type = match &pkesk {
+        pgp::packet::PublicKeyEncryptedSessionKey::V3 { .. } => EskType::V3_4,
+        pgp::packet::PublicKeyEncryptedSessionKey::V6 { .. } => EskType::V6,
+        other => return Err(Error::Crypto(format!("unsupported content key packet PKESK version: {other:?}"))),
+    };
+    let secret_subkey = node_key
+        .secret_key
+        .secret_subkeys
+        .first()
+        .ok_or_else(|| Error::Crypto("node key has no encryption subkey".into()))?;
+    let plain_session_key = secret_subkey
+        .key
+        .decrypt(
+            &Password::from(node_key.passphrase.as_str()),
+            pkesk
+                .values()
+                .map_err(|e| Error::Crypto(format!("bad content key packet values: {e}")))?,
+            esk_type,
+        )
+        .map_err(|e| Error::Crypto(format!("failed to decrypt content key packet: {e}")))?
+        .map_err(|e| Error::Crypto(format!("content key packet decryption rejected: {e}")))?;
+    // `PlainSessionKey` (confirmed in `src/composed/message/decrypt.rs`) has
+    // a third variant, `V5`, alongside `V3_4`/`V6` — this catch-all is
+    // required for the same exhaustiveness reason as the PKESK match above,
+    // not just defensive styling.
+    //
+    // Matches on `&plain_session_key` (not by value) and clones `key`:
+    // `PlainSessionKey` derives `ZeroizeOnDrop`, so partially moving `key`
+    // out of it by value is rejected at compile time (E0509, "cannot move
+    // out of type ..., which implements the Drop trait") — confirmed by
+    // actually hitting that error. `RawSessionKey` derives `Clone`, so
+    // cloning through the reference sidesteps it.
+    let content_key = match &plain_session_key {
+        PlainSessionKey::V3_4 { key, .. } => key.clone(),
+        PlainSessionKey::V6 { key } => key.clone(),
+        other => return Err(Error::Crypto(format!("unexpected session key variant: {other:?}"))),
+    };
+    Ok(ContentKeyPacket {
+        content_key,
+        packet_b64: String::new(),
+        packet_signature_armored: String::new(),
     })
 }
 
@@ -727,6 +821,119 @@ mod content_key_tests {
             panic!("expected a v3/v4 plain session key");
         };
         assert_eq!(key.as_ref(), content_key_packet.content_key.as_ref());
+    }
+}
+
+// Proves `decrypt_existing_content_key` can read a REAL, standalone,
+// properly-framed OpenPGP packet — not this crate's own headerless internal
+// shortcut (`generate_content_key`'s own `packet_b64`, which
+// `content_key_tests` above already documents as unparseable on its own:
+// "no packet header/framing to parse back"). That distinction is the whole
+// point of this task: a real Proton server's stored `ContentKeyPacket` is
+// produced by official OpenPGP libraries as a genuinely framed packet, so
+// the test packet here must be built the same way — via the `pgp` crate's
+// own generic packet-serialization path (`Packet::to_writer`), not by
+// reusing this crate's own generation shortcut.
+#[cfg(test)]
+mod existing_content_key_tests {
+    use super::*;
+
+    // Mirrors `generate_node_key`'s own dual-subkey shape (Ed25519Legacy
+    // primary, sign/certify-only + a Curve25519Legacy ECDH encryption
+    // subkey) but inlined rather than calling `generate_node_key` itself:
+    // that function also encrypts/signs the passphrase to a parent/address
+    // key this test has no use for (it never sends a `NodePassphrase`
+    // anywhere) — reusing it would mean generating two throwaway RSA-2048
+    // keys for no reason. This test only needs a real dual-subkey node key
+    // plus a passphrase it already knows.
+    fn generate_test_node_key(passphrase: &str) -> (SignedSecretKey, String) {
+        let mut encryption_subkey = SubkeyParamsBuilder::default();
+        encryption_subkey
+            .key_type(KeyType::ECDH(ECCCurve::Curve25519Legacy))
+            .can_sign(false)
+            .can_encrypt(EncryptionCaps::All)
+            .can_authenticate(false)
+            .passphrase(Some(passphrase.to_string()));
+        let mut key_params = SecretKeyParamsBuilder::default();
+        key_params
+            .key_type(KeyType::Ed25519Legacy)
+            .can_sign(true)
+            .can_encrypt(EncryptionCaps::None)
+            .primary_user_id("Test <test@example.com>".to_string())
+            .passphrase(Some(passphrase.to_string()))
+            .subkeys(vec![encryption_subkey.build().unwrap()]);
+        let params = key_params.build().expect("valid key params");
+        let secret_key = params.generate(rand08::rngs::OsRng).expect("key generation should succeed");
+        let armored = secret_key.to_armored_string(Default::default()).unwrap();
+        (secret_key, armored)
+    }
+
+    #[test]
+    fn decrypts_a_genuinely_framed_pkesk_packet() {
+        let (secret_key, armored_key) = generate_test_node_key("node passphrase");
+        let public_key = secret_key.to_public_key();
+        let encryption_subkey = public_key.public_subkeys.first().expect("has encryption subkey");
+
+        let rng = rand08::rngs::OsRng;
+        let original_session_key = SymmetricKeyAlgorithm::AES256.new_session_key(rng);
+        let pkesk = pgp::packet::PublicKeyEncryptedSessionKey::from_session_key_v3(
+            rng,
+            &original_session_key,
+            SymmetricKeyAlgorithm::AES256,
+            encryption_subkey,
+        )
+        .expect("encrypting the session key should succeed");
+
+        // Real packet framing (header + body) via the crate's generic
+        // packet serialization — NOT `generate_content_key`'s own
+        // `packet.to_writer(...)` body-only shortcut. `pgp::packet::Packet`
+        // wraps the PKESK, and its `Serialize` impl (confirmed in
+        // `packet_sum.rs`) routes every variant through
+        // `to_writer_with_header`, writing the full framed packet (header +
+        // body) — matching what a real OpenPGP library produces.
+        let framed_packet = pgp::packet::Packet::PublicKeyEncryptedSessionKey(pkesk);
+        let mut framed_bytes = Vec::new();
+        framed_packet.to_writer(&mut framed_bytes).expect("framing should succeed");
+        let packet_b64 = base64::engine::general_purpose::STANDARD.encode(&framed_bytes);
+
+        let node_key = UnlockedKey::new(&armored_key, "node passphrase".to_string()).unwrap();
+        let decrypted = decrypt_existing_content_key(&packet_b64, &node_key).unwrap();
+
+        assert_eq!(decrypted.content_key.as_ref(), original_session_key.as_ref());
+    }
+
+    // Regression guard, mirroring `block_crypto_tests::mismatched_aead_flag_fails_to_decrypt`'s
+    // own reasoning: the test above alone doesn't prove framing actually
+    // matters — a `decrypt_existing_content_key` that silently tolerated
+    // headerless input (e.g. by falling back to some lenient parse) would
+    // pass it unchanged. This proves the two shapes are genuinely distinct:
+    // `PublicKeyEncryptedSessionKey::to_writer` (used by `generate_content_key`
+    // for this crate's own internal `packet_b64`) writes only the PKESK
+    // body, with no packet header — feeding that body-only encoding to
+    // `PacketParser` (which expects a real header first) must fail, not
+    // silently succeed.
+    #[test]
+    fn body_only_bytes_without_a_packet_header_fail_to_parse() {
+        let (secret_key, armored_key) = generate_test_node_key("node passphrase");
+        let public_key = secret_key.to_public_key();
+        let encryption_subkey = public_key.public_subkeys.first().expect("has encryption subkey");
+        let rng = rand08::rngs::OsRng;
+        let original_session_key = SymmetricKeyAlgorithm::AES256.new_session_key(rng);
+        let pkesk = pgp::packet::PublicKeyEncryptedSessionKey::from_session_key_v3(
+            rng,
+            &original_session_key,
+            SymmetricKeyAlgorithm::AES256,
+            encryption_subkey,
+        )
+        .expect("encrypting the session key should succeed");
+
+        let mut body_only_bytes = Vec::new();
+        pkesk.to_writer(&mut body_only_bytes).expect("body serialization should succeed");
+        let body_only_b64 = base64::engine::general_purpose::STANDARD.encode(&body_only_bytes);
+
+        let node_key = UnlockedKey::new(&armored_key, "node passphrase".to_string()).unwrap();
+        let result = decrypt_existing_content_key(&body_only_b64, &node_key);
+        assert!(result.is_err(), "expected headerless body-only bytes to fail parsing, got {:?}", result.err());
     }
 }
 
