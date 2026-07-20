@@ -1,4 +1,6 @@
+mod api;
 mod cli;
+mod config;
 mod error;
 mod srp;
 
