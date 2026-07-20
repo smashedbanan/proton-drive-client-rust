@@ -3,6 +3,7 @@ use base64::Engine;
 use num_bigint::BigUint;
 use pgp::composed::{CleartextSignedMessage, Deserializable, SignedPublicKey};
 use sha2::{Digest, Sha512};
+extern crate bcrypt;
 
 /// Modulus is always exactly 2048 bits.
 pub const MODULUS_BYTE_LEN: usize = 256;
@@ -49,6 +50,64 @@ pub fn expand_hash(data: &[u8]) -> Vec<u8> {
     out
 }
 
+fn le_bytes_fixed(x: &BigUint) -> Vec<u8> {
+    let mut b = x.to_bytes_le();
+    b.resize(MODULUS_BYTE_LEN, 0);
+    b
+}
+
+fn bcrypt_full_hash(password: &[u8], salt16: [u8; 16]) -> Result<String> {
+    let parts = bcrypt::hash_with_salt(password, 10, salt16)
+        .map_err(|e| Error::Crypto(format!("bcrypt failed: {e}")))?;
+    Ok(parts.format_for_version(bcrypt::Version::TwoY))
+}
+
+/// Derives the SRP secret exponent "x" from the login password, the 10-byte
+/// SRP salt (base64), and the (already-verified) modulus. This is auth
+/// version 4 (current) only — the salt gets a literal "proton" suffix before
+/// bcrypt, and the full "$2y$10$..." bcrypt string (not just its hash tail)
+/// is what gets expand_hash'd together with the modulus.
+pub fn hash_password(password: &[u8], salt_b64: &str, modulus: &BigUint) -> Result<BigUint> {
+    let raw_salt = base64::engine::general_purpose::STANDARD
+        .decode(salt_b64)
+        .map_err(|e| Error::Crypto(format!("bad SRP salt base64: {e}")))?;
+    if raw_salt.len() != 10 {
+        return Err(Error::Crypto(format!(
+            "SRP salt must be 10 bytes, got {}",
+            raw_salt.len()
+        )));
+    }
+    let mut salt16 = [0u8; 16];
+    salt16[..10].copy_from_slice(&raw_salt);
+    salt16[10..].copy_from_slice(b"proton");
+    let full_hash = bcrypt_full_hash(password, salt16)?;
+    let mut buf = full_hash.into_bytes();
+    buf.extend_from_slice(&le_bytes_fixed(modulus));
+    Ok(BigUint::from_bytes_le(&expand_hash(&buf)))
+}
+
+/// Derives the passphrase that unlocks the account's private key, from the
+/// login password and the 16-byte key salt (base64, from `keys/salts`).
+/// Different from `hash_password` above: no "proton" suffix on the salt, and
+/// the result is the last 31 characters of the bcrypt string (the hash
+/// portion, with the "$2y$10$<22-char-salt>" prefix stripped), used directly
+/// as an OpenPGP passphrase — not further hashed.
+pub fn compute_key_password(password: &[u8], key_salt_b64: &str) -> Result<String> {
+    let raw_salt = base64::engine::general_purpose::STANDARD
+        .decode(key_salt_b64)
+        .map_err(|e| Error::Crypto(format!("bad key salt base64: {e}")))?;
+    if raw_salt.len() != 16 {
+        return Err(Error::Crypto(format!(
+            "key salt must be 16 bytes, got {}",
+            raw_salt.len()
+        )));
+    }
+    let mut salt16 = [0u8; 16];
+    salt16.copy_from_slice(&raw_salt);
+    let full_hash = bcrypt_full_hash(password, salt16)?;
+    Ok(full_hash[29..].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +151,37 @@ mod modulus_tests {
         let last = tampered.len();
         tampered.replace_range(last - 60..last - 59, "9");
         assert!(verify_and_decode_modulus(&tampered).is_err());
+    }
+}
+
+#[cfg(test)]
+mod password_tests {
+    use super::*;
+
+    #[test]
+    fn bcrypt_reproduces_real_proton_unicode_fixture() {
+        // From ProtonDriveApps/sdk's dotnet-crypto test suite (SrpSamples.cs) —
+        // a real Proton-authored test vector proving raw UTF-8 (including a
+        // 4-byte emoji) goes straight into bcrypt with no special-casing.
+        let password = "Password\n密碼\n👍\r\n".as_bytes();
+        let expected_hash = "$2y$10$HdJtqg//8quz/jfdqwLl1eaa5orjqwAkd28IBfgrlF5ofUaGEel9i";
+        assert!(bcrypt::verify(password, expected_hash).unwrap());
+    }
+
+    #[test]
+    fn hash_password_and_compute_key_password_run_without_error() {
+        // No official fixture exists for the full hash_password/compute_key_password
+        // pipeline (go-srp's own TestHashPassword/TestMailboxPassword are empty
+        // stubs). This just proves the composition runs end-to-end and produces
+        // a usable value; real correctness is confirmed against a live account
+        // when `login` is exercised manually (see Task 10).
+        let modulus = BigUint::from(2u32).pow(2048) - BigUint::from(159u32); // an arbitrary large odd number for shape-testing only
+        let salt10 = base64::engine::general_purpose::STANDARD.encode([7u8; 10]);
+        let x = hash_password(b"correct horse battery staple", &salt10, &modulus).unwrap();
+        assert!(x > BigUint::from(0u32));
+
+        let salt16 = base64::engine::general_purpose::STANDARD.encode([9u8; 16]);
+        let key_password = compute_key_password(b"correct horse battery staple", &salt16).unwrap();
+        assert_eq!(key_password.len(), 31);
     }
 }
