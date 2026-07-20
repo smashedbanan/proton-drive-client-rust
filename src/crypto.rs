@@ -97,6 +97,28 @@ pub struct NewNodeKey {
     passphrase: String,
 }
 
+impl NewNodeKey {
+    /// An `UnlockedKey` view of this freshly generated node key. Lets a
+    /// caller holding only a `NewNodeKey` (the "new file" case) call
+    /// anything written against `&UnlockedKey` — e.g.
+    /// `encrypt_and_sign_block`'s/`build_extended_attributes`'s node-key
+    /// parameter — the same way a caller holding an EXISTING node's real,
+    /// fetched-and-decrypted key does (Task 13's
+    /// `resolve_existing_node_key_and_content_key`, in `commands::upload`):
+    /// there is no "new" keypair in that second case, so unifying both on
+    /// `UnlockedKey` (already this crate's general "a key I can encrypt to
+    /// / sign with" currency — see `encrypt_to_key`) is what lets both
+    /// cases share one code path instead of duplicating it. Carries the
+    /// real passphrase, not an empty placeholder, so the result can still
+    /// sign (`build_extended_attributes` needs to), not just encrypt.
+    pub(crate) fn as_unlocked_key(&self) -> UnlockedKey {
+        UnlockedKey {
+            secret_key: self.secret_key.clone(),
+            passphrase: self.passphrase.clone(),
+        }
+    }
+}
+
 /// Generates a new node keypair locked by a fresh random passphrase, then
 /// produces the two artifacts a node-creation request needs: that
 /// passphrase encrypted to `parent`'s key, and its detached signature from
@@ -214,6 +236,17 @@ fn sign_detached(data: &[u8], key: &UnlockedKey) -> Result<String> {
 /// self-signed "content key packet" (the session key encrypted to the
 /// node's own key, with a self-signature over the raw key bytes) ready for
 /// the `ContentKeyPacket`/`ContentKeyPacketSignature` wire fields.
+///
+/// Derives `Clone` (never `Debug` — still secret material): `commands::upload`
+/// needs to hold either `ctx`'s freshly generated content key or one
+/// resolved from an existing node (Task 13's
+/// `resolve_existing_node_key_and_content_key`) as the same owned local
+/// across both arms of a name-conflict decision.
+// ponytail: cloning a ~32-byte session key plus two strings, once per
+// upload (never per-block), to unify both arms on one owned type — a
+// zero-copy `Cow`/enum split would avoid it but isn't worth the extra type
+// for a once-per-upload clone; revisit only if profiling ever says otherwise.
+#[derive(Clone)]
 pub struct ContentKeyPacket {
     pub content_key: pgp::composed::RawSessionKey,
     /// wire field `ContentKeyPacket` (base64 of the raw PKESK packet bytes)
@@ -396,6 +429,14 @@ pub struct EncryptedBlock {
 /// mismatch is the caller's responsibility (`commands::upload`, Task 11)
 /// via `decrypt_block_with_session_key` below.
 ///
+/// `node_key_for_signature_encryption` takes `&UnlockedKey`, not the
+/// narrower `&NewNodeKey` an earlier version of this function used: this
+/// parameter is only ever read for its public half (see below), and
+/// `commands::upload`'s conflict path (Task 13) needs to call this with an
+/// EXISTING node's fetched-and-decrypted key, which has no corresponding
+/// `NewNodeKey` at all (nothing was generated) — `NewNodeKey::as_unlocked_key`
+/// covers the other, "brand-new file" case.
+///
 /// `seipd_v1`/`seipd_v2` return the builder directly (they can't fail), but
 /// `set_session_key` takes `&mut self` and returns `Result<&mut Self>` while
 /// `to_vec` needs to consume the builder by value — so, same as
@@ -405,7 +446,7 @@ pub fn encrypt_and_sign_block(
     plaintext: &[u8],
     content_key: &ContentKeyPacket,
     signing_key: &UnlockedKey,
-    node_key_for_signature_encryption: &NewNodeKey,
+    node_key_for_signature_encryption: &UnlockedKey,
     aead: bool,
 ) -> Result<EncryptedBlock> {
     let rng = rand08::rngs::OsRng;
@@ -447,13 +488,10 @@ pub fn encrypt_and_sign_block(
     let sha256_hash: [u8; 32] = Sha256::digest(&ciphertext).into();
 
     let signature_armored = sign_detached(plaintext, signing_key)?;
-    let encrypted_signature_armored = encrypt_to_key(
-        signature_armored.as_bytes(),
-        &UnlockedKey {
-            secret_key: node_key_for_signature_encryption.secret_key.clone(),
-            passphrase: String::new(), // node key is used here only for its public half (encryption), never unlocked
-        },
-    )?;
+    // Only `node_key_for_signature_encryption`'s public half is ever used
+    // here (`encrypt_to_key` never reads a key's passphrase) — its
+    // passphrase, real or empty, is irrelevant to this call.
+    let encrypted_signature_armored = encrypt_to_key(signature_armored.as_bytes(), node_key_for_signature_encryption)?;
 
     Ok(EncryptedBlock {
         ciphertext,
@@ -557,6 +595,14 @@ pub struct ExtendedAttributesDigests {
 /// key encrypts block data; the node key encrypts metadata like this and
 /// the content-key-packet itself).
 ///
+/// `node_key` is `&UnlockedKey`, not the narrower `&NewNodeKey` an earlier
+/// version of this function took: unlike `encrypt_and_sign_block`'s same
+/// narrowing, this function genuinely signs with `node_key` (not just
+/// encrypts to its public half), so whatever is passed in must carry a
+/// real, working passphrase — both `NewNodeKey::as_unlocked_key` (new
+/// file) and an existing node's real, fetched-and-decrypted key
+/// (`commands::upload`'s Task 13 conflict path) satisfy that.
+///
 /// This deliberately does not call `encrypt_to_key` (Task 5): that helper
 /// is encrypt-only, matching its actual callers (`NodePassphrase`, the
 /// content-key packet), which sign separately and encrypt *that* detached
@@ -577,7 +623,7 @@ pub struct ExtendedAttributesDigests {
 /// is exactly what this module's own test does to prove it (decrypts the
 /// output and calls `.verify()` on it, rather than just checking that this
 /// function doesn't error).
-pub fn build_extended_attributes(attrs: &ExtendedAttributes, node_key: &NewNodeKey) -> Result<String> {
+pub fn build_extended_attributes(attrs: &ExtendedAttributes, node_key: &UnlockedKey) -> Result<String> {
     let json = serde_json::to_vec(attrs)
         .map_err(|e| Error::Crypto(format!("failed to serialize extended attributes: {e}")))?;
 
@@ -1006,7 +1052,9 @@ mod block_crypto_tests {
         let plaintext = b"pretend this is up to 4 MiB of file content";
 
         for aead in [false, true] {
-            let block = encrypt_and_sign_block(plaintext, &content_key, &address_signing_key, &node_key, aead).unwrap();
+            let block =
+                encrypt_and_sign_block(plaintext, &content_key, &address_signing_key, &node_key.as_unlocked_key(), aead)
+                    .unwrap();
 
             let decrypted = decrypt_block_with_session_key(&block.ciphertext, &content_key, aead).unwrap();
             assert_eq!(decrypted, plaintext, "aead={aead}");
@@ -1032,7 +1080,9 @@ mod block_crypto_tests {
         let plaintext = b"pretend this is up to 4 MiB of file content";
 
         for aead in [false, true] {
-            let block = encrypt_and_sign_block(plaintext, &content_key, &address_signing_key, &node_key, aead).unwrap();
+            let block =
+                encrypt_and_sign_block(plaintext, &content_key, &address_signing_key, &node_key.as_unlocked_key(), aead)
+                    .unwrap();
             assert!(
                 decrypt_block_with_session_key(&block.ciphertext, &content_key, !aead).is_err(),
                 "decrypting aead={aead} ciphertext with aead={} should fail",
@@ -1123,7 +1173,7 @@ mod manifest_tests {
             },
         };
 
-        let armored = build_extended_attributes(&attrs, &node_key).unwrap();
+        let armored = build_extended_attributes(&attrs, &node_key.as_unlocked_key()).unwrap();
         assert!(armored.contains("BEGIN PGP MESSAGE"));
 
         let (message, _headers) = Message::from_reader(armored.as_bytes()).unwrap();

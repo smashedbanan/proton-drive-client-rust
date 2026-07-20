@@ -1,16 +1,16 @@
 use crate::api::account::{fetch_addresses, fetch_feature_flag, Address};
 use crate::api::drive::{
-    commit_revision, create_file, create_revision, get_verification_input, prepare_block_upload,
-    upload_block_bytes, upload_small_file, upload_small_revision, BlockRegistration, CreateFileOutcome,
-    FileCreationRequest, RevisionCreationRequest, RevisionUpdateRequest, SmallFileUploadMetadata,
-    SmallRevisionUploadMetadata, VerifierPayload,
+    commit_revision, create_file, create_revision, get_link_details, get_verification_input,
+    prepare_block_upload, upload_block_bytes, upload_small_file, upload_small_revision, BlockRegistration,
+    CreateFileOutcome, FileCreationRequest, RevisionCreationRequest, RevisionUpdateRequest,
+    SmallFileUploadMetadata, SmallRevisionUploadMetadata, VerifierPayload,
 };
 use crate::api::ApiClient;
 use crate::crypto::{
     build_extended_attributes, build_manifest_signature, compute_verification_token, compute_whole_file_sha1,
-    decrypt_block_with_session_key, encrypt_and_sign_block, encrypt_to_key, generate_content_key,
-    generate_node_key, ContentKeyPacket, EncryptedBlock, ExtendedAttributes, ExtendedAttributesCommon,
-    ExtendedAttributesDigests, NewNodeKey, UnlockedKey,
+    decrypt_block_with_session_key, decrypt_existing_content_key, decrypt_message, encrypt_and_sign_block,
+    encrypt_to_key, generate_content_key, generate_node_key, ContentKeyPacket, EncryptedBlock, ExtendedAttributes,
+    ExtendedAttributesCommon, ExtendedAttributesDigests, NewNodeKey, UnlockedKey,
 };
 use crate::drive::{resolve_path, ResolvedFolder};
 use crate::error::{Error, Result};
@@ -117,10 +117,17 @@ struct UploadContext<'a> {
     use_aead: bool,
 }
 
-/// Encrypts `plaintext` under `ctx`'s content key and confirms the
+/// Encrypts `plaintext` under `node_key`/`content_key` and confirms the
 /// ciphertext actually decrypts back to the same bytes before this crate
-/// ever uploads it. A block's registered hash, and later the manifest
-/// signature, are both computed from whatever ciphertext
+/// ever uploads it. `node_key`/`content_key` are explicit parameters,
+/// rather than read off `ctx` directly, because which ones are correct
+/// varies per call: a freshly generated key/content-key for a brand-new
+/// file (`ctx.new_node_key.as_unlocked_key()`/`ctx.content_key`), or an
+/// existing node's real, fetched-and-decrypted ones on a name conflict
+/// (Task 13's `resolve_existing_node_key_and_content_key`) — see that
+/// function's own doc comment for why reusing the existing content key is
+/// required, not optional. A block's registered hash, and later the
+/// manifest signature, are both computed from whatever ciphertext
 /// `encrypt_and_sign_block` happens to produce — so a corrupted encryption
 /// would otherwise ship a self-consistent but silently-wrong upload; the
 /// server has no independent way to catch that. Retries once on a mismatch
@@ -132,13 +139,17 @@ struct UploadContext<'a> {
 /// gives up loudly rather than silently uploading unverified data.
 ///
 /// Shared by both `upload_general`'s per-block loop and `upload_small`'s
-/// single whole-file block, rather than duplicating the retry logic at
-/// each call site.
-fn encrypt_verified_block(ctx: &UploadContext, plaintext: &[u8]) -> Result<EncryptedBlock> {
+/// whole-file block (including its conflict-path re-encryption, Task 13),
+/// rather than duplicating the retry logic at each call site.
+fn encrypt_verified_block(
+    ctx: &UploadContext,
+    node_key: &UnlockedKey,
+    content_key: &ContentKeyPacket,
+    plaintext: &[u8],
+) -> Result<EncryptedBlock> {
     for _ in 0..2 {
-        let block =
-            encrypt_and_sign_block(plaintext, ctx.content_key, ctx.address_key, ctx.new_node_key, ctx.use_aead)?;
-        let round_trips = decrypt_block_with_session_key(&block.ciphertext, ctx.content_key, ctx.use_aead)
+        let block = encrypt_and_sign_block(plaintext, content_key, ctx.address_key, node_key, ctx.use_aead)?;
+        let round_trips = decrypt_block_with_session_key(&block.ciphertext, content_key, ctx.use_aead)
             .map(|decrypted| decrypted == plaintext)
             .unwrap_or(false);
         if round_trips {
@@ -148,6 +159,34 @@ fn encrypt_verified_block(ctx: &UploadContext, plaintext: &[u8]) -> Result<Encry
     Err(Error::Crypto(
         "block failed integrity verification twice in a row; aborting upload".into(),
     ))
+}
+
+/// Resolves an EXISTING node's own key and content key, for the
+/// conflict-to-new-revision path: reusing the existing content key is
+/// required (see `crypto::generate_content_key`'s doc comment — a content
+/// key is per-file, generated once, reused across every revision), not
+/// optional. Unlocks the node's key using `ctx.folder.folder_key` — the
+/// PARENT folder's already-unlocked key, the same one that encrypted this
+/// existing node's `NodePassphrase`/`Name` in the first place — exactly
+/// mirroring the decrypt-passphrase-then-`UnlockedKey::new` pattern
+/// `drive::resolve_path` already uses for every folder it walks through.
+fn resolve_existing_node_key_and_content_key(
+    ctx: &UploadContext,
+    existing_link_id: &str,
+) -> Result<(UnlockedKey, ContentKeyPacket)> {
+    let details = get_link_details(ctx.client, &ctx.folder.volume_id, &[existing_link_id.to_string()])?;
+    let link = details
+        .links
+        .first()
+        .ok_or_else(|| Error::Crypto("server returned no details for the conflicting node".into()))?;
+    let node_passphrase = decrypt_message(&link.node_passphrase, &ctx.folder.folder_key)?;
+    let node_key = UnlockedKey::new(&link.node_key, node_passphrase)?;
+    let file_details = link
+        .file
+        .as_ref()
+        .ok_or_else(|| Error::Crypto("conflicting node has no file content-key material".into()))?;
+    let content_key = decrypt_existing_content_key(&file_details.content_key_packet, &node_key)?;
+    Ok((node_key, content_key))
 }
 
 /// General (multi-block) path: create-or-conflict, then per ~4 MiB chunk
@@ -169,57 +208,32 @@ fn upload_general(ctx: &UploadContext, file: &mut File) -> Result<String> {
         signature_email_address: &ctx.address.email,
     };
 
-    // ponytail: KNOWN CORRECTNESS GAP, not a stylistic shortcut — flagging
-    // for whoever picks this up next, not silently working around it.
-    // `create_revision` below only registers a new revision on
-    // `existing_link_id`; it never fetches that node's *real* NodeKey or
-    // ContentKeyPacket. Every block below then encrypts under `ctx`'s
-    // freshly-generated `new_node_key`/`content_key` (from `run`) instead —
-    // a key nobody but this one process ever knew, and that is never sent
-    // to the server for this existing node (`RevisionCreationRequest` and
-    // `SmallRevisionUploadMetadata` carry no key fields at all, confirming
-    // the server expects the *existing* content key to be reused, not
-    // replaced). So today, re-uploading to a path that already has a file
-    // reports success but produces a revision nobody can ever decrypt —
-    // confirmed against the real reference SDK during Task 11's adversarial
-    // review: `client/js/src/internal/upload/manager.ts:97-98` refuses to
-    // create a revision at all without an already-resolved
-    // `nodeKeys.contentKeyPacketSessionKey`; that session key comes from
-    // decrypting `Link.File.ContentKeyPacket`/`ContentKeyPacketSignature`
-    // (`client/js/src/internal/nodes/apiService.ts:730-731`) via the
-    // node's own unlocked key (`client/js/src/internal/nodes/cryptoService.ts:517-534`).
-    // Fixing this for real needs: (1) `api::drive::LinkDetails` extended
-    // with those two `File`-nested fields (not currently fetched anywhere
-    // in this crate — Task 2's scope never needed a file's content key,
-    // only folders' names/keys for path walking), and (2) a new
-    // `crypto::` function to decrypt an existing content-key packet via
-    // the node's own secret subkey — the underlying `pgp`-crate mechanism
-    // is already proven, just not in production code:
-    // `crypto::content_key_tests::generate_content_key_packet_decrypts_back_via_the_node_keys_own_secret_subkey`.
-    // Not fixed here: it reaches into already-reviewed Tasks 2/5/6, and
-    // this crate's own `generate_content_key` (Task 5) writes
-    // `ContentKeyPacket` as a headerless PKESK body (see that function's
-    // own doc comment), which is unverified against what a real Proton
-    // server / other real clients' packets actually look like on the wire
-    // without a live account to test against — guessing at that byte
-    // format risked shipping something that *looks* fixed but is silently
-    // wrong in a different way. See Task 11's report for the full
-    // citations and reasoning.
-    let (link_id, revision_id) = match create_file(ctx.client, &ctx.folder.volume_id, &file_creation)? {
-        CreateFileOutcome::Created(ids) => (ids.link_id, ids.revision_id),
-        CreateFileOutcome::NameConflict(conflict) => {
-            let existing_link_id = conflict
-                .link_id
-                .ok_or_else(|| Error::Crypto("server reported a name conflict with no conflicting node ID".into()))?;
-            let revision_req = RevisionCreationRequest {
-                current_revision_id: None,
-                client_uid: None,
-                intended_upload_size: ctx.file_size as i64,
-            };
-            let created = create_revision(ctx.client, &ctx.folder.volume_id, &existing_link_id, &revision_req)?;
-            (existing_link_id, created.revision.revision_id)
-        }
-    };
+    // Reuses the existing node's real key/content-key on a name conflict
+    // (Task 13) instead of `ctx`'s freshly-generated ones: `create_revision`
+    // below only registers a new revision, it never resolves key material
+    // by itself — see `resolve_existing_node_key_and_content_key`'s doc
+    // comment for why the existing content key specifically must be
+    // reused, never replaced (confirmed against the real reference SDK
+    // during Task 11's adversarial review; see that task's report).
+    let (link_id, revision_id, node_key_for_blocks, content_key_for_blocks) =
+        match create_file(ctx.client, &ctx.folder.volume_id, &file_creation)? {
+            CreateFileOutcome::Created(ids) => {
+                (ids.link_id, ids.revision_id, ctx.new_node_key.as_unlocked_key(), ctx.content_key.clone())
+            }
+            CreateFileOutcome::NameConflict(conflict) => {
+                let existing_link_id = conflict.link_id.ok_or_else(|| {
+                    Error::Crypto("server reported a name conflict with no conflicting node ID".into())
+                })?;
+                let revision_req = RevisionCreationRequest {
+                    current_revision_id: None,
+                    client_uid: None,
+                    intended_upload_size: ctx.file_size as i64,
+                };
+                let created = create_revision(ctx.client, &ctx.folder.volume_id, &existing_link_id, &revision_req)?;
+                let (node_key, content_key) = resolve_existing_node_key_and_content_key(ctx, &existing_link_id)?;
+                (existing_link_id, created.revision.revision_id, node_key, content_key)
+            }
+        };
 
     let mut block_hashes = Vec::new();
     let mut block_sizes = Vec::new();
@@ -231,7 +245,7 @@ fn upload_general(ctx: &UploadContext, file: &mut File) -> Result<String> {
             break;
         }
         let plaintext = &buf[..n];
-        let encrypted_block = encrypt_verified_block(ctx, plaintext)?;
+        let encrypted_block = encrypt_verified_block(ctx, &node_key_for_blocks, &content_key_for_blocks, plaintext)?;
 
         let verification = get_verification_input(ctx.client, &ctx.folder.volume_id, &link_id, &revision_id)?;
         let verification_code = base64::engine::general_purpose::STANDARD
@@ -267,7 +281,7 @@ fn upload_general(ctx: &UploadContext, file: &mut File) -> Result<String> {
     }
 
     let manifest_signature = build_manifest_signature(&block_hashes, ctx.address_key)?;
-    let xattr_armored = build_xattr(file, ctx.file_size, block_sizes, ctx.new_node_key)?;
+    let xattr_armored = build_xattr(file, ctx.file_size, block_sizes, &node_key_for_blocks)?;
 
     let commit_req = RevisionUpdateRequest {
         manifest_signature: &manifest_signature,
@@ -285,14 +299,18 @@ fn upload_general(ctx: &UploadContext, file: &mut File) -> Result<String> {
 /// name conflict, retries as new-revision against the conflicting node —
 /// the same "always new revision" behavior as `upload_general`, applied to
 /// the small-upload endpoints (`upload_small_file`/`upload_small_revision`,
-/// Task 6) instead of `create_file`/`create_revision`.
+/// Task 6) instead of `create_file`/`create_revision`. On conflict, the
+/// whole-file block is genuinely re-encrypted under the existing node's
+/// real key/content-key (Task 13) — the first, optimistic encryption below
+/// used the wrong key and can't be reused; see the `NameConflict` arm.
 fn upload_small(ctx: &UploadContext, file: &mut File) -> Result<String> {
     let mut plaintext = Vec::with_capacity(ctx.file_size as usize);
     file.read_to_end(&mut plaintext).map_err(Error::Io)?;
 
-    let encrypted_block = encrypt_verified_block(ctx, &plaintext)?;
+    let node_key = ctx.new_node_key.as_unlocked_key();
+    let encrypted_block = encrypt_verified_block(ctx, &node_key, ctx.content_key, &plaintext)?;
     let manifest_signature = build_manifest_signature(&[encrypted_block.sha256_hash], ctx.address_key)?;
-    let xattr_armored = build_xattr(file, ctx.file_size, vec![plaintext.len() as u64], ctx.new_node_key)?;
+    let xattr_armored = build_xattr(file, ctx.file_size, vec![plaintext.len() as u64], &node_key)?;
 
     let new_file_metadata = SmallFileUploadMetadata {
         name: ctx.encrypted_name,
@@ -310,16 +328,30 @@ fn upload_small(ctx: &UploadContext, file: &mut File) -> Result<String> {
         extended_attributes: &xattr_armored,
     };
 
-    // ponytail: same known gap as `upload_general`'s `NameConflict` arm —
-    // see the full comment there. `upload_small_revision` below also never
-    // reuses the existing node's real content key; this path encrypted
-    // `encrypted_block` under the freshly-generated `ctx.content_key` above.
     match upload_small_file(ctx.client, &ctx.folder.volume_id, &new_file_metadata, &encrypted_block.ciphertext)? {
         CreateFileOutcome::Created(ids) => Ok(ids.revision_id),
         CreateFileOutcome::NameConflict(conflict) => {
             let existing_link_id = conflict
                 .link_id
                 .ok_or_else(|| Error::Crypto("server reported a name conflict with no conflicting node ID".into()))?;
+
+            // The optimistic encryption above used `ctx`'s freshly-generated
+            // key/content-key, sent with the new-file attempt that just
+            // turned out to conflict — that ciphertext can't be reused (it
+            // was encrypted under the wrong key entirely). Re-encrypt the
+            // same plaintext under the existing node's real key/content-key
+            // (Task 13), then rebuild the manifest signature and XAttr from
+            // THAT encryption — both depend on the actual ciphertext
+            // produced, which changes with the key, even though
+            // `block_sizes`/`file_size` don't (same file, same size). Real,
+            // deliberate duplicate work: the common (no-conflict) case above
+            // pays none of it.
+            let (existing_node_key, existing_content_key) =
+                resolve_existing_node_key_and_content_key(ctx, &existing_link_id)?;
+            let encrypted_block = encrypt_verified_block(ctx, &existing_node_key, &existing_content_key, &plaintext)?;
+            let manifest_signature = build_manifest_signature(&[encrypted_block.sha256_hash], ctx.address_key)?;
+            let xattr_armored = build_xattr(file, ctx.file_size, vec![plaintext.len() as u64], &existing_node_key)?;
+
             let revision_metadata = SmallRevisionUploadMetadata {
                 signature_email_address: &ctx.address.email,
                 manifest_signature: &manifest_signature,
@@ -357,7 +389,7 @@ fn upload_small(ctx: &UploadContext, file: &mut File) -> Result<String> {
 /// 1965-01-01`) — `humantime::Rfc3339Timestamp`'s `Display` impl panics
 /// (`.duration_since(UNIX_EPOCH).expect(...)`) on a pre-epoch value rather
 /// than erroring, so this must never hand it one.
-fn build_xattr(file: &mut File, file_size: u64, block_sizes: Vec<u64>, node_key: &NewNodeKey) -> Result<String> {
+fn build_xattr(file: &mut File, file_size: u64, block_sizes: Vec<u64>, node_key: &UnlockedKey) -> Result<String> {
     file.rewind().map_err(Error::Io)?;
     let sha1_hex = compute_whole_file_sha1(&mut *file)?;
     let modified = file.metadata().map_err(Error::Io)?.modified().unwrap_or(std::time::UNIX_EPOCH);
