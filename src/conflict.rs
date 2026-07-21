@@ -83,7 +83,13 @@ fn prompt_for_choice(local_path: &Path) -> Result<ConflictChoice> {
         print!("{} already exists. [s]kip, [r]eplace, or [k]eep both? ", local_path.display());
         std::io::stdout().flush().map_err(Error::Io)?;
         let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer).map_err(Error::Io)?;
+        let n = std::io::stdin().read_line(&mut answer).map_err(Error::Io)?;
+        if n == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "no input available for conflict prompt",
+            )));
+        }
         match answer.trim().to_lowercase().as_str() {
             "s" | "skip" => return Ok(ConflictChoice::Skip),
             "r" | "replace" => return Ok(ConflictChoice::Replace),
