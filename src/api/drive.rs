@@ -29,6 +29,23 @@ pub struct Share {
     pub creator: String,
 }
 
+/// A file link's currently-active revision — confirmed present on the same
+/// `get_link_details`/`list_folder_children` response upload already calls,
+/// per the reference C# wire type `ActiveRevisionDto`
+/// (`client/cs/src/Proton.Drive.Sdk/Api/Files/ActiveRevisionDto.cs:7-30` in
+/// the local SDK clone).
+#[derive(Deserialize)]
+pub struct ActiveRevisionDetails {
+    #[serde(rename = "RevisionID")]
+    pub revision_id: String,
+    #[serde(rename = "ManifestSignature")]
+    pub manifest_signature: Option<String>,
+    #[serde(rename = "XAttr")]
+    pub extended_attributes: Option<String>,
+    #[serde(rename = "SignatureEmail")]
+    pub signature_email: Option<String>,
+}
+
 // No `Debug` — holds a content-key packet, key material by another name.
 #[derive(Deserialize)]
 pub struct LinkFileDetails {
@@ -40,6 +57,8 @@ pub struct LinkFileDetails {
     /// pattern.
     #[serde(rename = "ContentKeyPacketSignature")]
     pub content_key_packet_signature: Option<String>,
+    #[serde(rename = "ActiveRevision")]
+    pub active_revision: ActiveRevisionDetails,
 }
 
 /// The subset of a link's details needed to decrypt its name and descend
@@ -425,7 +444,8 @@ mod shape_tests {
     fn link_details_deserializes_file_content_key_fields_when_present() {
         let json = r#"{"Links": [
             {"LinkID": "l1", "Name": "n", "NodeKey": "k", "NodePassphrase": "p",
-             "File": {"ContentKeyPacket": "cpk-b64", "ContentKeyPacketSignature": "armored-sig"}}
+             "File": {"ContentKeyPacket": "cpk-b64", "ContentKeyPacketSignature": "armored-sig",
+                      "ActiveRevision": {"RevisionID": "rev-1"}}}
         ]}"#;
         let parsed: LinkDetailsResponse = serde_json::from_str(json).unwrap();
         let file = parsed.links[0].file.as_ref().expect("file field should be present");
@@ -436,11 +456,40 @@ mod shape_tests {
     fn link_file_details_content_key_packet_signature_defaults_to_none_when_absent() {
         let json = r#"{"Links": [
             {"LinkID": "l1", "Name": "n", "NodeKey": "k", "NodePassphrase": "p",
-             "File": {"ContentKeyPacket": "cpk-b64"}}
+             "File": {"ContentKeyPacket": "cpk-b64", "ActiveRevision": {"RevisionID": "rev-1"}}}
         ]}"#;
         let parsed: LinkDetailsResponse = serde_json::from_str(json).unwrap();
         let file = parsed.links[0].file.as_ref().expect("file field should be present");
         assert_eq!(file.content_key_packet_signature, None);
+    }
+
+    #[test]
+    fn active_revision_deserializes_with_optional_fields_present() {
+        let json = r#"{"Links": [
+            {"LinkID": "l1", "Name": "n", "NodeKey": "k", "NodePassphrase": "p",
+             "File": {"ContentKeyPacket": "cpk-b64",
+                      "ActiveRevision": {"RevisionID": "rev-1", "ManifestSignature": "armored-sig",
+                                         "XAttr": "armored-xattr", "SignatureEmail": "signer@example.com"}}}
+        ]}"#;
+        let parsed: LinkDetailsResponse = serde_json::from_str(json).unwrap();
+        let file = parsed.links[0].file.as_ref().expect("file field should be present");
+        assert_eq!(file.active_revision.revision_id, "rev-1");
+        assert_eq!(file.active_revision.manifest_signature.as_deref(), Some("armored-sig"));
+        assert_eq!(file.active_revision.extended_attributes.as_deref(), Some("armored-xattr"));
+        assert_eq!(file.active_revision.signature_email.as_deref(), Some("signer@example.com"));
+    }
+
+    #[test]
+    fn active_revision_optional_fields_default_to_none_when_absent() {
+        let json = r#"{"Links": [
+            {"LinkID": "l1", "Name": "n", "NodeKey": "k", "NodePassphrase": "p",
+             "File": {"ContentKeyPacket": "cpk-b64", "ActiveRevision": {"RevisionID": "rev-1"}}}
+        ]}"#;
+        let parsed: LinkDetailsResponse = serde_json::from_str(json).unwrap();
+        let file = parsed.links[0].file.as_ref().expect("file field should be present");
+        assert_eq!(file.active_revision.manifest_signature, None);
+        assert_eq!(file.active_revision.extended_attributes, None);
+        assert_eq!(file.active_revision.signature_email, None);
     }
 
     #[test]
