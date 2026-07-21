@@ -15,6 +15,12 @@ pub enum Command {
         local: String,
         remote: String,
     },
+    Download {
+        remote: String,
+        local: String,
+        #[arg(long)]
+        conflict_strategy: Option<crate::conflict::ConflictChoice>,
+    },
 }
 
 #[cfg(test)]
@@ -44,6 +50,35 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Upload { local: "./file.txt".to_string(), remote: "/my-files/docs".to_string() }
+        );
+    }
+
+    #[test]
+    fn parses_download_with_remote_and_local_args() {
+        let cli = Cli::try_parse_from(["proton-drive", "download", "/my-files/docs/file.txt", "./file.txt"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Download {
+                remote: "/my-files/docs/file.txt".to_string(),
+                local: "./file.txt".to_string(),
+                conflict_strategy: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_download_with_conflict_strategy_flag() {
+        let cli = Cli::try_parse_from([
+            "proton-drive", "download", "/my-files/docs/file.txt", "./file.txt", "--conflict-strategy", "keep-both",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Download {
+                remote: "/my-files/docs/file.txt".to_string(),
+                local: "./file.txt".to_string(),
+                conflict_strategy: Some(crate::conflict::ConflictChoice::KeepBoth),
+            }
         );
     }
 }
