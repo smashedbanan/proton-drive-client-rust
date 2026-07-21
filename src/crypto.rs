@@ -636,6 +636,19 @@ pub fn decrypt_block_with_session_key(ciphertext: &[u8], content_key: &ContentKe
         .map_err(|e| Error::Crypto(format!("failed to read decrypted block: {e}")))
 }
 
+/// Decrypts a downloaded block without knowing in advance whether it was
+/// AEAD (SEIPDv2)-framed or not. Upload resolves this from a feature-flag
+/// check *before* encrypting (`commands::upload`'s `use_aead`); download has
+/// no such advance signal — see the download design doc's Open Risks.
+/// Tries AEAD first, then falls back to non-AEAD. Safe to do so: passing
+/// the wrong `aead` value to `decrypt_block_with_session_key` already fails
+/// cleanly rather than silently succeeding with wrong output — proved by
+/// this module's own `mismatched_aead_flag_fails_to_decrypt` test.
+pub fn decrypt_block_auto(ciphertext: &[u8], content_key: &ContentKeyPacket) -> Result<Vec<u8>> {
+    decrypt_block_with_session_key(ciphertext, content_key, true)
+        .or_else(|_| decrypt_block_with_session_key(ciphertext, content_key, false))
+}
+
 /// The block-upload registration payload's `Verifier.Token`: `verification_code`
 /// XOR'd against a same-length prefix of `ciphertext` (per the reference
 /// SDKs — a tamper-binding value, not a hash).
@@ -1247,6 +1260,20 @@ mod block_crypto_tests {
                 "decrypting aead={aead} ciphertext with aead={} should fail",
                 !aead
             );
+        }
+    }
+
+    #[test]
+    fn decrypt_block_auto_detects_either_framing() {
+        let (address_signing_key, node_key, content_key) = fresh_block_fixture();
+        let plaintext = b"pretend this is up to 4 MiB of file content";
+
+        for aead in [false, true] {
+            let block =
+                encrypt_and_sign_block(plaintext, &content_key, &address_signing_key, &node_key.as_unlocked_key(), aead)
+                    .unwrap();
+            let decrypted = decrypt_block_auto(&block.ciphertext, &content_key).unwrap();
+            assert_eq!(decrypted, plaintext, "aead={aead}");
         }
     }
 
