@@ -1,5 +1,6 @@
-use crate::error::Result;
-use std::path::Path;
+use crate::error::{Error, Result};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// How to handle a local-file conflict on download — ported 1:1 from the
 /// reference CLI's own three file-conflict strategies
@@ -37,6 +38,109 @@ pub fn available_name(parent_dir: &Path, base_name: &str) -> Result<String> {
             return Ok(candidate);
         }
         i += 1;
+    }
+}
+
+/// Resolves a potential conflict at `local_path`: if nothing exists there,
+/// returns it unchanged, no prompt. Otherwise applies `forced` if given,
+/// else prompts interactively (plain stdin/stdout — the same mechanism
+/// `login` already uses for its username prompt, `commands/login.rs:12-16`;
+/// unlike the password prompt, this needs no masking, so it doesn't use
+/// `rpassword`). `Skip` returns `Ok(None)` — not an error, matching
+/// upload's own "not a failure" treatment of its create-vs-revision
+/// branch. `Replace` removes the existing file before returning the same
+/// path. `KeepBoth` returns a sibling path from `available_name`.
+pub fn resolve_conflict(local_path: &Path, forced: Option<ConflictChoice>) -> Result<Option<PathBuf>> {
+    if !local_path.exists() {
+        return Ok(Some(local_path.to_path_buf()));
+    }
+
+    let choice = match forced {
+        Some(choice) => choice,
+        None => prompt_for_choice(local_path)?,
+    };
+
+    match choice {
+        ConflictChoice::Skip => Ok(None),
+        ConflictChoice::Replace => {
+            std::fs::remove_file(local_path).map_err(Error::Io)?;
+            Ok(Some(local_path.to_path_buf()))
+        }
+        ConflictChoice::KeepBoth => {
+            let parent = local_path.parent().unwrap_or_else(|| Path::new("."));
+            let base_name = local_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| Error::Crypto("local file path has no usable file name".into()))?;
+            let name = available_name(parent, base_name)?;
+            Ok(Some(parent.join(name)))
+        }
+    }
+}
+
+fn prompt_for_choice(local_path: &Path) -> Result<ConflictChoice> {
+    loop {
+        print!("{} already exists. [s]kip, [r]eplace, or [k]eep both? ", local_path.display());
+        std::io::stdout().flush().map_err(Error::Io)?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).map_err(Error::Io)?;
+        match answer.trim().to_lowercase().as_str() {
+            "s" | "skip" => return Ok(ConflictChoice::Skip),
+            "r" | "replace" => return Ok(ConflictChoice::Replace),
+            "k" | "keep-both" | "keep both" => return Ok(ConflictChoice::KeepBoth),
+            _ => println!("Please enter 's', 'r', or 'k'."),
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolve_conflict_tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("proton-drive-resolve-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn returns_the_path_unchanged_when_nothing_exists_there() {
+        let dir = temp_dir("no-conflict");
+        let target = dir.join("file.txt");
+        let resolved = resolve_conflict(&target, None).unwrap();
+        assert_eq!(resolved, Some(target));
+    }
+
+    #[test]
+    fn forced_skip_returns_none_without_touching_the_file() {
+        let dir = temp_dir("forced-skip");
+        let target = dir.join("file.txt");
+        fs::write(&target, b"original").unwrap();
+        let resolved = resolve_conflict(&target, Some(ConflictChoice::Skip)).unwrap();
+        assert_eq!(resolved, None);
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+    }
+
+    #[test]
+    fn forced_replace_removes_the_existing_file_and_returns_the_same_path() {
+        let dir = temp_dir("forced-replace");
+        let target = dir.join("file.txt");
+        fs::write(&target, b"original").unwrap();
+        let resolved = resolve_conflict(&target, Some(ConflictChoice::Replace)).unwrap();
+        assert_eq!(resolved, Some(target.clone()));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn forced_keep_both_returns_an_available_sibling_path() {
+        let dir = temp_dir("forced-keep-both");
+        let target = dir.join("file.txt");
+        fs::write(&target, b"original").unwrap();
+        let resolved = resolve_conflict(&target, Some(ConflictChoice::KeepBoth)).unwrap();
+        assert_eq!(resolved, Some(dir.join("file (1).txt")));
+        assert_eq!(fs::read(&target).unwrap(), b"original");
     }
 }
 
