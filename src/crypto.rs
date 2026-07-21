@@ -656,6 +656,33 @@ pub fn build_manifest_signature(block_hashes: &[[u8; 32]], signing_key: &Unlocke
     sign_detached(&manifest, signing_key)
 }
 
+/// Verifies a revision's manifest signature over its concatenated block
+/// hashes (thumbnails-then-content order — this crate never has
+/// thumbnails, so always content-only, matching `build_manifest_signature`'s
+/// own concatenation), returning a hard `Err` on ANY failure: missing
+/// signature, malformed armor, or a non-matching signature. Unlike every
+/// other signature check in this crate (`verify_signature`/
+/// `verify_signature_any`/`decrypt_and_verify_name`, all non-fatal
+/// warn-and-proceed), a corrupted or unverifiable manifest means the
+/// downloaded content's integrity can't be trusted at all — both reference
+/// SDKs treat this as fatal (see the download design doc's Background
+/// section: `cryptoService.ts`'s `verifyManifest` throws;
+/// `RevisionReader.cs` throws `CompletedDownloadManifestVerificationException`).
+/// Deliberately a separate function from `verify_signature`, not a reuse
+/// of its non-fatal `SignatureCheck` return type, even though it reuses
+/// `verify_signature` internally for the actual cryptographic check.
+pub fn verify_manifest(
+    block_hashes: &[[u8; 32]],
+    armored_manifest_signature: Option<&str>,
+    verifying_key: &UnlockedKey,
+) -> Result<()> {
+    let manifest: Vec<u8> = block_hashes.iter().flatten().copied().collect();
+    match verify_signature(armored_manifest_signature, &manifest, verifying_key) {
+        SignatureCheck::Verified => Ok(()),
+        SignatureCheck::Failed(reason) => Err(Error::Crypto(format!("manifest verification failed: {reason}"))),
+    }
+}
+
 /// The plaintext content of the `XAttr` wire field before it's PGP-encrypted
 /// and signed. Field names mirror the reference SDKs' `Common`/`Digests`
 /// shape (see the upload design doc) — serialized as JSON before encryption,
@@ -1242,6 +1269,39 @@ mod manifest_tests {
         let hashes = [[1u8; 32], [2u8; 32]];
         let signature_armored = build_manifest_signature(&hashes, &signing_key).unwrap();
         assert!(signature_armored.contains("BEGIN PGP SIGNATURE"));
+    }
+
+    #[test]
+    fn verify_manifest_accepts_a_signature_over_the_same_hashes() {
+        let signing_key = generate_test_parent("signing passphrase");
+        let hashes = [[1u8; 32], [2u8; 32]];
+        let signature = build_manifest_signature(&hashes, &signing_key).unwrap();
+        assert!(verify_manifest(&hashes, Some(&signature), &signing_key).is_ok());
+    }
+
+    #[test]
+    fn verify_manifest_rejects_a_tampered_hash_list() {
+        let signing_key = generate_test_parent("signing passphrase");
+        let hashes = [[1u8; 32], [2u8; 32]];
+        let signature = build_manifest_signature(&hashes, &signing_key).unwrap();
+        let tampered_hashes = [[1u8; 32], [9u8; 32]];
+        assert!(verify_manifest(&tampered_hashes, Some(&signature), &signing_key).is_err());
+    }
+
+    #[test]
+    fn verify_manifest_rejects_a_missing_signature() {
+        let signing_key = generate_test_parent("signing passphrase");
+        let hashes = [[1u8; 32]];
+        assert!(verify_manifest(&hashes, None, &signing_key).is_err());
+    }
+
+    #[test]
+    fn verify_manifest_rejects_the_wrong_verifying_key() {
+        let signing_key = generate_test_parent("signing passphrase");
+        let other_key = generate_test_parent("other passphrase");
+        let hashes = [[1u8; 32]];
+        let signature = build_manifest_signature(&hashes, &signing_key).unwrap();
+        assert!(verify_manifest(&hashes, Some(&signature), &other_key).is_err());
     }
 
     #[test]
