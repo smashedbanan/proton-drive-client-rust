@@ -25,3 +25,6 @@ docs/superpowers/
 
 # Implementation worktrees (superpowers:using-git-worktrees)
 .claude/worktrees/
+
+# Local reference clones (e.g. the Proton Drive SDK) — not meant to be pushed to the remote
+local/
