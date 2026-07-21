@@ -2,6 +2,7 @@ mod api;
 mod cli;
 mod commands;
 mod config;
+mod conflict;
 mod crypto;
 mod drive;
 mod error;
