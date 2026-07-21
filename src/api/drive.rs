@@ -20,6 +20,13 @@ pub struct Share {
     pub passphrase_signature: String,
     #[serde(rename = "AddressID")]
     pub membership_address_id: String,
+    /// The address that claims to have created this share (and signed its
+    /// passphrase) — distinct from `membership_address_id`, which is
+    /// whichever address's key packet decrypts the share key. For a
+    /// personal "My files" share these are typically the same account's
+    /// own address, but not guaranteed to be the identical one.
+    #[serde(rename = "Creator")]
+    pub creator: String,
 }
 
 // No `Debug` — holds a content-key packet, key material by another name.
@@ -41,10 +48,25 @@ pub struct LinkDetails {
     pub link_id: String,
     #[serde(rename = "Name")]
     pub name: String,
+    /// The address that claims to have signed `name`'s embedded signature —
+    /// can differ from `signature_email` below (a rename can be signed by
+    /// a different address than the one that created the node). Absent
+    /// means anonymous, verified against the parent folder's key instead.
+    #[serde(rename = "NameSignatureEmail")]
+    pub name_signature_email: Option<String>,
     #[serde(rename = "NodeKey")]
     pub node_key: String,
     #[serde(rename = "NodePassphrase")]
     pub node_passphrase: String,
+    /// Detached signature over the decrypted `node_passphrase` — absent
+    /// means not signed at all (a real, legitimate case, not an error).
+    #[serde(rename = "NodePassphraseSignature")]
+    pub node_passphrase_signature: Option<String>,
+    /// The address that claims to have signed `node_passphrase` — also
+    /// covers the content-key packet's claim when `file` is present (the
+    /// wire protocol has no separate claim field for that).
+    #[serde(rename = "SignatureEmail")]
+    pub signature_email: Option<String>,
     /// File-type links only (`Link.File.*` on the wire); absent for folders.
     #[serde(rename = "File")]
     pub file: Option<LinkFileDetails>,
@@ -344,12 +366,37 @@ mod shape_tests {
     fn share_response_deserializes() {
         let json = r#"{
             "Volume": {"VolumeID": "vol-1"},
-            "Share": {"Key": "armored-key", "Passphrase": "armored-msg", "PassphraseSignature": "armored-sig", "AddressID": "addr-1"},
+            "Share": {"Key": "armored-key", "Passphrase": "armored-msg", "PassphraseSignature": "armored-sig", "AddressID": "addr-1", "Creator": "creator@example.com"},
             "Link": {"LinkID": "root-link", "Name": "armored-name", "NodeKey": "armored-key-2", "NodePassphrase": "armored-msg-2"}
         }"#;
         let parsed: ShareResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.volume.id, "vol-1");
         assert_eq!(parsed.link.link_id, "root-link");
+        assert_eq!(parsed.share.creator, "creator@example.com");
+    }
+
+    #[test]
+    fn link_details_deserializes_signature_fields_when_present() {
+        let json = r#"{"Links": [
+            {"LinkID": "l1", "Name": "n", "NodeKey": "k", "NodePassphrase": "p",
+             "NodePassphraseSignature": "armored-sig", "SignatureEmail": "signer@example.com",
+             "NameSignatureEmail": "renamer@example.com"}
+        ]}"#;
+        let parsed: LinkDetailsResponse = serde_json::from_str(json).unwrap();
+        let link = &parsed.links[0];
+        assert_eq!(link.node_passphrase_signature.as_deref(), Some("armored-sig"));
+        assert_eq!(link.signature_email.as_deref(), Some("signer@example.com"));
+        assert_eq!(link.name_signature_email.as_deref(), Some("renamer@example.com"));
+    }
+
+    #[test]
+    fn link_details_signature_fields_default_to_none_when_absent() {
+        let json = r#"{"Links": [{"LinkID": "l1", "Name": "n", "NodeKey": "k", "NodePassphrase": "p"}]}"#;
+        let parsed: LinkDetailsResponse = serde_json::from_str(json).unwrap();
+        let link = &parsed.links[0];
+        assert_eq!(link.node_passphrase_signature, None);
+        assert_eq!(link.signature_email, None);
+        assert_eq!(link.name_signature_email, None);
     }
 
     #[test]
