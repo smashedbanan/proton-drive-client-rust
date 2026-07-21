@@ -1,4 +1,4 @@
-use crate::api::account::{fetch_addresses, fetch_feature_flag, Address};
+use crate::api::account::{fetch_addresses, fetch_feature_flag, Address, AddressesResponse};
 use crate::api::drive::{
     commit_revision, create_file, create_revision, fetch_my_files_share, get_link_details, get_verification_input,
     prepare_block_upload, upload_block_bytes, upload_small_file, upload_small_revision, BlockRegistration,
@@ -12,7 +12,7 @@ use crate::crypto::{
     encrypt_to_key, generate_content_key, generate_node_key, ContentKeyPacket, EncryptedBlock, ExtendedAttributes,
     ExtendedAttributesCommon, ExtendedAttributesDigests, NewNodeKey, UnlockedKey,
 };
-use crate::drive::{resolve_path, ResolvedFolder};
+use crate::drive::{resolve_path, verify_claim, warn_on_signature_failure, ResolvedFolder};
 use crate::error::{Error, Result};
 use crate::session;
 use base64::Engine;
@@ -68,7 +68,7 @@ pub fn run(local_path: &str, remote_path: &str) -> Result<()> {
         })?;
     let address_key = UnlockedKey::new(&address_key_dto.private_key, creds.user_key_password.clone())?;
 
-    let folder = resolve_path(&client, share, &address_key, remote_path)?;
+    let folder = resolve_path(&client, share, &address_key, &addresses, &creds.user_key_password, remote_path)?;
 
     let name_hash_digest = hex::encode(Sha256::digest(file_name.as_bytes()));
     let new_node_key = generate_node_key(&folder.folder_key, &address_key)?;
@@ -85,6 +85,8 @@ pub fn run(local_path: &str, remote_path: &str) -> Result<()> {
         folder: &folder,
         address,
         address_key: &address_key,
+        addresses: &addresses,
+        key_password: &creds.user_key_password,
         new_node_key: &new_node_key,
         content_key: &content_key,
         encrypted_name: &encrypted_name,
@@ -116,6 +118,8 @@ struct UploadContext<'a> {
     folder: &'a ResolvedFolder,
     address: &'a Address,
     address_key: &'a UnlockedKey,
+    addresses: &'a AddressesResponse,
+    key_password: &'a str,
     new_node_key: &'a NewNodeKey,
     content_key: &'a ContentKeyPacket,
     encrypted_name: &'a str,
@@ -188,12 +192,34 @@ fn resolve_existing_node_key_and_content_key(
         .first()
         .ok_or_else(|| Error::Crypto("server returned no details for the conflicting node".into()))?;
     let node_passphrase = decrypt_message(&link.node_passphrase, &ctx.folder.folder_key)?;
+    warn_on_signature_failure(
+        &format!("conflicting node {existing_link_id}'s passphrase"),
+        verify_claim(
+            link.signature_email.as_deref(),
+            ctx.addresses,
+            ctx.key_password,
+            Some(&ctx.folder.folder_key),
+            link.node_passphrase_signature.as_deref(),
+            node_passphrase.as_bytes(),
+        ),
+    );
     let node_key = UnlockedKey::new(&link.node_key, node_passphrase)?;
     let file_details = link
         .file
         .as_ref()
         .ok_or_else(|| Error::Crypto("conflicting node has no file content-key material".into()))?;
     let content_key = decrypt_existing_content_key(&file_details.content_key_packet, &node_key)?;
+    warn_on_signature_failure(
+        &format!("conflicting node {existing_link_id}'s content-key packet"),
+        verify_claim(
+            link.signature_email.as_deref(),
+            ctx.addresses,
+            ctx.key_password,
+            Some(&ctx.folder.folder_key),
+            Some(file_details.content_key_packet_signature.as_str()),
+            content_key.content_key.as_ref(),
+        ),
+    );
     Ok((node_key, content_key))
 }
 
