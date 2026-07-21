@@ -694,13 +694,13 @@ pub fn verify_manifest(
 /// packet wire serialization, e.g. `generate_content_key`'s
 /// `packet.to_writer(...)`), and both traits share the bare name
 /// `Serialize` — importing both under that name would collide.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ExtendedAttributes {
     #[serde(rename = "Common")]
     pub common: ExtendedAttributesCommon,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ExtendedAttributesCommon {
     #[serde(rename = "Size")]
     pub total_size: u64,
@@ -712,7 +712,7 @@ pub struct ExtendedAttributesCommon {
     pub digests: ExtendedAttributesDigests,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ExtendedAttributesDigests {
     #[serde(rename = "SHA1")]
     pub sha1_hex: String,
@@ -778,6 +778,35 @@ pub fn build_extended_attributes(attrs: &ExtendedAttributes, node_key: &Unlocked
     builder
         .to_armored_string(rng, Default::default())
         .map_err(|e| Error::Crypto(format!("failed to sign and encrypt extended attributes: {e}")))
+}
+
+/// Decrypts a file's `XAttr` blob (an armored message with an embedded
+/// signature, produced by `build_extended_attributes` — see that
+/// function's doc comment for why the signature lives inside the
+/// encrypted content rather than as a sibling detached field) using the
+/// file's own node key, parsing the resulting JSON back into
+/// `ExtendedAttributes`. Mirrors `decrypt_and_verify_name`'s embedded-
+/// signature pattern, but the plaintext is a JSON document rather than a
+/// bare name string, and the only legitimate verifier is the node's own
+/// key — XAttr has no separate claimed-signer field on the wire, unlike
+/// passphrase/name/content-key-packet (`build_extended_attributes` always
+/// signs with `node_key` itself, never a separate address key).
+pub fn decrypt_and_verify_xattr(armored_message: &str, node_key: &UnlockedKey) -> Result<(ExtendedAttributes, SignatureCheck)> {
+    let (message, _headers) = Message::from_reader(armored_message.as_bytes())
+        .map_err(|e| Error::Crypto(format!("bad encrypted XAttr message: {e}")))?;
+    let mut decrypted = message
+        .decrypt(&Password::from(node_key.passphrase.as_str()), &node_key.secret_key)
+        .map_err(|e| Error::Crypto(format!("failed to decrypt XAttr: {e}")))?;
+    let bytes = decrypted
+        .as_data_vec()
+        .map_err(|e| Error::Crypto(format!("failed to read decrypted XAttr: {e}")))?;
+    let attrs: ExtendedAttributes = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Crypto(format!("XAttr was not valid JSON: {e}")))?;
+    let check = match decrypted.verify(node_key.secret_key.primary_key.public_key()) {
+        Ok(_signature) => SignatureCheck::Verified,
+        Err(e) => SignatureCheck::Failed(format!("embedded XAttr signature did not verify: {e}")),
+    };
+    Ok((attrs, check))
 }
 
 /// Computes the whole-file SHA-1 hex digest, streamed over `reader` in
@@ -1355,6 +1384,67 @@ mod manifest_tests {
         decrypted
             .verify(node_key.secret_key.primary_key.public_key())
             .expect("XAttr message's inline signature should verify against the node key's own public half");
+    }
+
+    #[test]
+    fn decrypt_and_verify_xattr_round_trips_and_verifies() {
+        let parent = generate_test_parent("parent passphrase");
+        let address_signing_key = generate_test_parent("address passphrase");
+        let node_key = generate_node_key(&parent, &address_signing_key).unwrap();
+        let unlocked_node_key = node_key.as_unlocked_key();
+
+        let attrs = ExtendedAttributes {
+            common: ExtendedAttributesCommon {
+                total_size: 4_194_304,
+                modification_time: "2026-07-20T00:00:00Z".to_string(),
+                block_sizes: vec![4_194_304],
+                digests: ExtendedAttributesDigests {
+                    sha1_hex: "da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string(),
+                },
+            },
+        };
+        let armored = build_extended_attributes(&attrs, &unlocked_node_key).unwrap();
+
+        let (decoded, check) = decrypt_and_verify_xattr(&armored, &unlocked_node_key).unwrap();
+        assert_eq!(decoded.common.total_size, 4_194_304);
+        assert_eq!(decoded.common.digests.sha1_hex, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert!(matches!(check, SignatureCheck::Verified));
+    }
+
+    // Builds a message signed by a DIFFERENT node key than the one used to
+    // decrypt, proving the embedded signature is checked against the right
+    // key (mismatch -> Failed) without failing decryption itself (the JSON
+    // is still encrypted to the real node_key's own public half, only the
+    // SIGNATURE belongs to somebody else). `build_extended_attributes`
+    // always signs+encrypts with the SAME key, so this constructs its own
+    // signed-then-mismatched message by hand rather than calling it.
+    #[test]
+    fn decrypt_and_verify_xattr_rejects_a_mismatched_signature_but_still_decodes() {
+        let parent = generate_test_parent("parent passphrase");
+        let address_signing_key = generate_test_parent("address passphrase");
+        let node_key = generate_node_key(&parent, &address_signing_key).unwrap();
+        let unlocked_node_key = node_key.as_unlocked_key();
+        let other_node_key = generate_node_key(&parent, &address_signing_key).unwrap();
+        let unlocked_other_key = other_node_key.as_unlocked_key();
+
+        let attrs = ExtendedAttributes {
+            common: ExtendedAttributesCommon {
+                total_size: 1,
+                modification_time: "2026-07-20T00:00:00Z".to_string(),
+                block_sizes: vec![1],
+                digests: ExtendedAttributesDigests { sha1_hex: "abc".to_string() },
+            },
+        };
+        let json = serde_json::to_vec(&attrs).unwrap();
+        let rng = rand08::rngs::OsRng;
+        let mut builder = pgp::composed::MessageBuilder::from_bytes("", json).seipd_v1(rng, SymmetricKeyAlgorithm::AES256);
+        builder.sign(&unlocked_other_key.secret_key.primary_key, Password::from(unlocked_other_key.passphrase.as_str()), HashAlgorithm::Sha256);
+        add_recipient(&mut builder, &unlocked_node_key).unwrap();
+        let armored = builder.to_armored_string(rng, Default::default()).unwrap();
+
+        let (decoded, check) = decrypt_and_verify_xattr(&armored, &unlocked_node_key).unwrap();
+        assert_eq!(decoded.common.total_size, 1);
+        assert!(matches!(check, SignatureCheck::Failed(_)));
     }
 }
 
