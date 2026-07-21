@@ -57,7 +57,7 @@ pub fn resolve_conflict(local_path: &Path, forced: Option<ConflictChoice>) -> Re
 
     let choice = match forced {
         Some(choice) => choice,
-        None => prompt_for_choice(local_path)?,
+        None => prompt_for_choice(local_path, &mut std::io::stdin().lock())?,
     };
 
     match choice {
@@ -78,12 +78,12 @@ pub fn resolve_conflict(local_path: &Path, forced: Option<ConflictChoice>) -> Re
     }
 }
 
-fn prompt_for_choice(local_path: &Path) -> Result<ConflictChoice> {
+fn prompt_for_choice(local_path: &Path, input: &mut impl std::io::BufRead) -> Result<ConflictChoice> {
     loop {
         print!("{} already exists. [s]kip, [r]eplace, or [k]eep both? ", local_path.display());
         std::io::stdout().flush().map_err(Error::Io)?;
         let mut answer = String::new();
-        let n = std::io::stdin().read_line(&mut answer).map_err(Error::Io)?;
+        let n = input.read_line(&mut answer).map_err(Error::Io)?;
         if n == 0 {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -95,6 +95,26 @@ fn prompt_for_choice(local_path: &Path) -> Result<ConflictChoice> {
             "r" | "replace" => return Ok(ConflictChoice::Replace),
             "k" | "keep-both" | "keep both" => return Ok(ConflictChoice::KeepBoth),
             _ => println!("Please enter 's', 'r', or 'k'."),
+        }
+    }
+}
+
+#[cfg(test)]
+mod prompt_for_choice_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    // Regression test for a real bug (commit 36b08f2): `prompt_for_choice`
+    // used to busy-loop forever on stdin EOF instead of erroring. Confirms
+    // a `read_line` returning `Ok(0)` (EOF) surfaces as a clean
+    // `UnexpectedEof` error instead of looping.
+    #[test]
+    fn eof_on_input_errors_cleanly_instead_of_looping() {
+        let mut input = Cursor::new(&b""[..]);
+        let err = prompt_for_choice(Path::new("irrelevant.txt"), &mut input).unwrap_err();
+        match err {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof),
+            other => panic!("expected Error::Io(UnexpectedEof), got {other:?}"),
         }
     }
 }

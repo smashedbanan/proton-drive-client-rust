@@ -138,6 +138,18 @@ fn download_to_file(ctx: &DownloadContext, target_path: &Path) -> Result<()> {
     let mut block_hashes = Vec::new();
     let mut sha1_hasher = Sha1::new();
     let mut from_block_index: i64 = 1;
+    // Captured from the *first* page of `get_revision` (not from `ctx.revision`,
+    // an `ActiveRevisionDetails` fetched earlier via link details) — the reference
+    // SDKs source the manifest signature, its signer claim, and the XAttr blob
+    // from this endpoint's response (`RevisionReader.cs`'s `VerifyManifestAsync`
+    // reads `_state.RevisionDto.ManifestSignature`; TS's `fileDownloader.ts`
+    // captures `armoredManifestSignature` from `iterateRevisionBlocks`'s first
+    // page), never from the link-details endpoint. Every page repeats the same
+    // revision-level values, so capturing them once, from the first page seen
+    // (including a zero-block revision's only page), is correct.
+    let mut manifest_signature: Option<String> = None;
+    let mut signature_email: Option<String> = None;
+    let mut extended_attributes: Option<String> = None;
 
     loop {
         let page = get_revision(
@@ -148,6 +160,11 @@ fn download_to_file(ctx: &DownloadContext, target_path: &Path) -> Result<()> {
             from_block_index,
             BLOCK_PAGE_SIZE,
         )?;
+        if from_block_index == 1 {
+            manifest_signature = page.manifest_signature.clone();
+            signature_email = page.signature_email.clone();
+            extended_attributes = page.extended_attributes.clone();
+        }
         if page.blocks.is_empty() {
             break;
         }
@@ -168,16 +185,16 @@ fn download_to_file(ctx: &DownloadContext, target_path: &Path) -> Result<()> {
     output.flush().map_err(Error::Io)?;
 
     let manifest_verifying_key = resolve_verifying_key(
-        ctx.revision.signature_email.as_deref(),
+        signature_email.as_deref(),
         ctx.addresses,
         ctx.key_password,
         Some(ctx.node_key),
     )
     .map_err(|reason| Error::Crypto(format!("cannot verify manifest: {reason}")))?;
-    verify_manifest(&block_hashes, ctx.revision.manifest_signature.as_deref(), &manifest_verifying_key)?;
+    verify_manifest(&block_hashes, manifest_signature.as_deref(), &manifest_verifying_key)?;
 
     let actual_sha1_hex: String = sha1_hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    if let Some(xattr_armored) = ctx.revision.extended_attributes.as_deref() {
+    if let Some(xattr_armored) = extended_attributes.as_deref() {
         match decrypt_and_verify_xattr(xattr_armored, ctx.node_key) {
             Ok((attrs, SignatureCheck::Verified)) => {
                 if attrs.common.digests.sha1_hex != actual_sha1_hex {

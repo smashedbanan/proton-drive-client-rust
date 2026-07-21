@@ -825,6 +825,8 @@ pub struct RevisionBlockEntry {
 pub struct RevisionDetails {
     #[serde(rename = "ManifestSignature")]
     pub manifest_signature: Option<String>,
+    #[serde(rename = "XAttr")]
+    pub extended_attributes: Option<String>,
     #[serde(rename = "SignatureEmail")]
     pub signature_email: Option<String>,
     #[serde(rename = "Blocks")]
@@ -936,6 +938,7 @@ mod revision_shape_tests {
     fn revision_details_response_deserializes() {
         let json = r#"{"Revision": {
             "ManifestSignature": "armored-sig",
+            "XAttr": "armored-xattr",
             "SignatureEmail": "signer@example.com",
             "Blocks": [
                 {"Index": 1, "BareURL": "https://example.com/blob1", "Token": "tok1", "Hash": "aGFzaDE="},
@@ -944,6 +947,8 @@ mod revision_shape_tests {
         }}"#;
         let parsed: RevisionDetailsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.revision.manifest_signature.as_deref(), Some("armored-sig"));
+        assert_eq!(parsed.revision.extended_attributes.as_deref(), Some("armored-xattr"));
+        assert_eq!(parsed.revision.signature_email.as_deref(), Some("signer@example.com"));
         assert_eq!(parsed.revision.blocks.len(), 2);
         assert_eq!(parsed.revision.blocks[0].index, 1);
         assert_eq!(parsed.revision.blocks[1].bare_url, "https://example.com/blob2");
@@ -954,6 +959,8 @@ mod revision_shape_tests {
         let json = r#"{"Revision": {"Blocks": []}}"#;
         let parsed: RevisionDetailsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.revision.manifest_signature, None);
+        assert_eq!(parsed.revision.extended_attributes, None);
+        assert_eq!(parsed.revision.signature_email, None);
         assert!(parsed.revision.blocks.is_empty());
     }
 }
