@@ -160,6 +160,43 @@ pub fn resolve_path(
     })
 }
 
+/// Resolves a leading-slash, section-rooted path (e.g. `/my-files/foo/bar.txt`)
+/// to an existing FILE — unlike `resolve_path` above, which stops at the
+/// last segment's PARENT folder (upload's use case: the destination
+/// folder, with the new file's name supplied separately from the local
+/// basename). Download needs the file itself, so this resolves the path's
+/// parent folder exactly the way `resolve_path` already does, then makes
+/// one more `find_child_by_name` call for the final segment. Returns the
+/// parent `ResolvedFolder` alongside the file's own `LinkDetails` — the
+/// caller needs the parent's key to decrypt the file's `NodePassphrase`,
+/// the same way `resolve_path`'s own loop decrypts each child it finds
+/// using the current (parent) key before descending further.
+pub fn resolve_file_path(
+    client: &ApiClient,
+    share: ShareResponse,
+    address_key: &UnlockedKey,
+    addresses: &AddressesResponse,
+    key_password: &str,
+    path: &str,
+) -> Result<(ResolvedFolder, crate::api::drive::LinkDetails)> {
+    let (parent_path, file_name) = path
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .ok_or_else(|| Error::Crypto(format!("path '{path}' has no file name segment")))?;
+    let folder = resolve_path(client, share, address_key, addresses, key_password, parent_path)?;
+    let file_link = find_child_by_name(
+        client,
+        &folder.volume_id,
+        &folder.folder_link_id,
+        &folder.folder_key,
+        file_name,
+        addresses,
+        key_password,
+    )?
+    .ok_or_else(|| Error::Crypto(format!("no such file: '{file_name}' does not exist under this path")))?;
+    Ok((folder, file_link))
+}
+
 /// Lists `parent_link_id`'s children (paginating via `AnchorID`/`More`),
 /// decrypting each candidate's name with the already-unlocked `parent_key`
 /// until `target_name` matches, or every page is exhausted.
