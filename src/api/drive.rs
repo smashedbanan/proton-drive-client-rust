@@ -782,6 +782,59 @@ pub fn get_verification_input(
     client.get(&path)
 }
 
+#[derive(Deserialize)]
+pub struct RevisionBlockEntry {
+    #[serde(rename = "Index")]
+    pub index: i64,
+    #[serde(rename = "BareURL")]
+    pub bare_url: String,
+    #[serde(rename = "Token")]
+    pub token: String,
+    #[serde(rename = "Hash")]
+    pub hash_b64: String,
+}
+
+#[derive(Deserialize)]
+pub struct RevisionDetails {
+    #[serde(rename = "ManifestSignature")]
+    pub manifest_signature: Option<String>,
+    #[serde(rename = "SignatureEmail")]
+    pub signature_email: Option<String>,
+    #[serde(rename = "Blocks")]
+    pub blocks: Vec<RevisionBlockEntry>,
+}
+
+#[derive(Deserialize)]
+struct RevisionDetailsResponse {
+    #[serde(rename = "Revision")]
+    revision: RevisionDetails,
+}
+
+/// `GET v2/volumes/{volumeId}/files/{linkId}/revisions/{revisionId}` —
+/// paginated via `PageSize`/`FromBlockIndex` query parameters, a different
+/// pagination shape than `list_folder_children`'s `AnchorID` cursor (this
+/// endpoint has no cursor token — the caller just advances
+/// `from_block_index` past the last block index it received). Confirmed
+/// against both reference SDKs
+/// (`client/js/src/internal/download/apiService.ts:25-74`'s
+/// `iterateRevisionBlocks`, `client/cs/.../Nodes/Download/RevisionReader.cs:252-339`'s
+/// `GetBlocksAsync`) in the local SDK clone. Call repeatedly with an
+/// advancing `from_block_index` until a page returns zero blocks.
+pub fn get_revision(
+    client: &ApiClient,
+    volume_id: &str,
+    link_id: &str,
+    revision_id: &str,
+    from_block_index: i64,
+    page_size: i64,
+) -> Result<RevisionDetails> {
+    let path = format!(
+        "v2/volumes/{volume_id}/files/{link_id}/revisions/{revision_id}?PageSize={page_size}&FromBlockIndex={from_block_index}"
+    );
+    let resp: RevisionDetailsResponse = client.get(&path)?;
+    Ok(resp.revision)
+}
+
 #[derive(Serialize)]
 pub struct RevisionUpdateRequest<'a> {
     #[serde(rename = "ManifestSignature")]
@@ -845,5 +898,35 @@ mod block_upload_shape_tests {
         let json = r#"{"Code":1000,"SomeOtherField":"whatever"}"#;
         assert!(serde_json::from_str::<CommitRevisionResponse>(json).is_ok());
         assert!(serde_json::from_str::<()>(json).is_err());
+    }
+}
+
+#[cfg(test)]
+mod revision_shape_tests {
+    use super::*;
+
+    #[test]
+    fn revision_details_response_deserializes() {
+        let json = r#"{"Revision": {
+            "ManifestSignature": "armored-sig",
+            "SignatureEmail": "signer@example.com",
+            "Blocks": [
+                {"Index": 1, "BareURL": "https://example.com/blob1", "Token": "tok1", "Hash": "aGFzaDE="},
+                {"Index": 2, "BareURL": "https://example.com/blob2", "Token": "tok2", "Hash": "aGFzaDI="}
+            ]
+        }}"#;
+        let parsed: RevisionDetailsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.revision.manifest_signature.as_deref(), Some("armored-sig"));
+        assert_eq!(parsed.revision.blocks.len(), 2);
+        assert_eq!(parsed.revision.blocks[0].index, 1);
+        assert_eq!(parsed.revision.blocks[1].bare_url, "https://example.com/blob2");
+    }
+
+    #[test]
+    fn revision_details_response_deserializes_with_empty_blocks_and_no_manifest_signature() {
+        let json = r#"{"Revision": {"Blocks": []}}"#;
+        let parsed: RevisionDetailsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.revision.manifest_signature, None);
+        assert!(parsed.revision.blocks.is_empty());
     }
 }
