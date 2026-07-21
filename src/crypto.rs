@@ -203,16 +203,35 @@ pub(crate) fn encrypt_to_key(plaintext: &[u8], key: &UnlockedKey) -> Result<Stri
     let mut builder = pgp::composed::MessageBuilder::from_bytes("", plaintext.to_vec())
         .seipd_v1(rng, SymmetricKeyAlgorithm::AES256);
 
+    add_recipient(&mut builder, key)?;
+
+    builder
+        .to_armored_string(rng, Default::default())
+        .map_err(|e| Error::Crypto(format!("failed to armor encrypted message: {e}")))
+}
+
+/// Adds `key` as an encryption recipient on `builder`, preferring its first
+/// public encryption subkey over its primary — real node/parent keys are
+/// "dual-subkey" (see `generate_node_key`): an Ed25519Legacy primary that is
+/// sign/certify-only, plus a Curve25519 encryption subkey, so the primary
+/// alone can't encrypt (confirmed empirically in Task 3: "EdDSALegacy is only
+/// used for signing"). Falls back to the primary for single-key shapes (e.g.
+/// this module's RSA test keys). Shared by `encrypt_to_key` and
+/// `build_extended_attributes` — both only ever build a SEIPDv1 message here;
+/// `encrypt_and_sign_block` is the only AEAD-capable builder, and never needs
+/// this (it always encrypts to the content key, never to a recipient key).
+fn add_recipient<R: std::io::Read>(
+    builder: &mut pgp::composed::MessageBuilder<'_, R, pgp::composed::EncryptionSeipdV1>,
+    key: &UnlockedKey,
+) -> Result<()> {
+    let rng = rand08::rngs::OsRng;
     let public_key = key.secret_key.to_public_key();
     match public_key.public_subkeys.first() {
         Some(subkey) => builder.encrypt_to_key(rng, subkey),
         None => builder.encrypt_to_key(rng, &public_key),
     }
-    .map_err(|e| Error::Crypto(format!("failed to encrypt to recipient: {e}")))?;
-
-    builder
-        .to_armored_string(rng, Default::default())
-        .map_err(|e| Error::Crypto(format!("failed to armor encrypted message: {e}")))
+    .map_err(|e| Error::Crypto(format!("failed to add encryption recipient: {e}")))?;
+    Ok(())
 }
 
 /// Detached-signs `data` with `key`, armored — used for `NodePassphraseSignature`
@@ -641,13 +660,7 @@ pub fn build_extended_attributes(attrs: &ExtendedAttributes, node_key: &Unlocked
         HashAlgorithm::Sha256,
     );
 
-    // Same "primary can't encrypt, use the subkey" fallback as `encrypt_to_key`.
-    let public_key = node_key.secret_key.to_public_key();
-    match public_key.public_subkeys.first() {
-        Some(subkey) => builder.encrypt_to_key(rng, subkey),
-        None => builder.encrypt_to_key(rng, &public_key),
-    }
-    .map_err(|e| Error::Crypto(format!("failed to encrypt extended attributes: {e}")))?;
+    add_recipient(&mut builder, node_key)?;
 
     builder
         .to_armored_string(rng, Default::default())
@@ -950,9 +963,13 @@ mod existing_content_key_tests {
         (secret_key, armored)
     }
 
-    #[test]
-    fn decrypts_a_genuinely_framed_pkesk_packet() {
-        let (secret_key, armored_key) = generate_test_node_key("node passphrase");
+    // Shared by both PKESK-framing tests below: a real node key plus a PKESK
+    // encrypting a fresh session key to its encryption subkey. They diverge
+    // only in how that `pkesk` gets serialized (real framing vs. body-only).
+    fn generate_test_pkesk(
+        passphrase: &str,
+    ) -> (String, pgp::packet::PublicKeyEncryptedSessionKey, pgp::composed::RawSessionKey) {
+        let (secret_key, armored_key) = generate_test_node_key(passphrase);
         let public_key = secret_key.to_public_key();
         let encryption_subkey = public_key.public_subkeys.first().expect("has encryption subkey");
 
@@ -965,6 +982,13 @@ mod existing_content_key_tests {
             encryption_subkey,
         )
         .expect("encrypting the session key should succeed");
+
+        (armored_key, pkesk, original_session_key)
+    }
+
+    #[test]
+    fn decrypts_a_genuinely_framed_pkesk_packet() {
+        let (armored_key, pkesk, original_session_key) = generate_test_pkesk("node passphrase");
 
         // Real packet framing (header + body) via the crate's generic
         // packet serialization — NOT `generate_content_key`'s own
@@ -996,18 +1020,7 @@ mod existing_content_key_tests {
     // first) must fail, not silently succeed.
     #[test]
     fn body_only_bytes_without_a_packet_header_fail_to_parse() {
-        let (secret_key, armored_key) = generate_test_node_key("node passphrase");
-        let public_key = secret_key.to_public_key();
-        let encryption_subkey = public_key.public_subkeys.first().expect("has encryption subkey");
-        let rng = rand08::rngs::OsRng;
-        let original_session_key = SymmetricKeyAlgorithm::AES256.new_session_key(rng);
-        let pkesk = pgp::packet::PublicKeyEncryptedSessionKey::from_session_key_v3(
-            rng,
-            &original_session_key,
-            SymmetricKeyAlgorithm::AES256,
-            encryption_subkey,
-        )
-        .expect("encrypting the session key should succeed");
+        let (armored_key, pkesk, _original_session_key) = generate_test_pkesk("node passphrase");
 
         let mut body_only_bytes = Vec::new();
         pkesk.to_writer(&mut body_only_bytes).expect("body serialization should succeed");
@@ -1042,13 +1055,20 @@ mod block_crypto_tests {
         UnlockedKey::new(&armored, passphrase.to_string()).unwrap()
     }
 
-    #[test]
-    fn encrypt_and_sign_block_round_trips() {
+    // Shared by both tests below: a real node key plus content key, ready to
+    // encrypt a block under either framing. They diverge only in which
+    // `aead` flag `decrypt_block_with_session_key` is called with.
+    fn fresh_block_fixture() -> (UnlockedKey, NewNodeKey, ContentKeyPacket) {
         let parent = generate_test_parent("parent passphrase");
         let address_signing_key = generate_test_parent("address passphrase");
         let node_key = generate_node_key(&parent, &address_signing_key).unwrap();
         let content_key = generate_content_key(&node_key).unwrap();
+        (address_signing_key, node_key, content_key)
+    }
 
+    #[test]
+    fn encrypt_and_sign_block_round_trips() {
+        let (address_signing_key, node_key, content_key) = fresh_block_fixture();
         let plaintext = b"pretend this is up to 4 MiB of file content";
 
         for aead in [false, true] {
@@ -1073,10 +1093,7 @@ mod block_crypto_tests {
     // session key only pairs with a v2/AEAD SEIPD message and vice versa).
     #[test]
     fn mismatched_aead_flag_fails_to_decrypt() {
-        let parent = generate_test_parent("parent passphrase");
-        let address_signing_key = generate_test_parent("address passphrase");
-        let node_key = generate_node_key(&parent, &address_signing_key).unwrap();
-        let content_key = generate_content_key(&node_key).unwrap();
+        let (address_signing_key, node_key, content_key) = fresh_block_fixture();
         let plaintext = b"pretend this is up to 4 MiB of file content";
 
         for aead in [false, true] {

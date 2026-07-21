@@ -2,8 +2,8 @@ use crate::api::account::{fetch_addresses, fetch_feature_flag, Address};
 use crate::api::drive::{
     commit_revision, create_file, create_revision, get_link_details, get_verification_input,
     prepare_block_upload, upload_block_bytes, upload_small_file, upload_small_revision, BlockRegistration,
-    CreateFileOutcome, FileCreationRequest, RevisionCreationRequest, RevisionUpdateRequest,
-    SmallFileUploadMetadata, SmallRevisionUploadMetadata, VerifierPayload,
+    CreateFileOutcome, FileCreationRequest, NewNodeMetadata, RevisionCreationRequest, RevisionUpdateRequest,
+    SmallFileUploadMetadata, VerifierPayload,
 };
 use crate::api::ApiClient;
 use crate::crypto::{
@@ -189,11 +189,10 @@ fn resolve_existing_node_key_and_content_key(
     Ok((node_key, content_key))
 }
 
-/// General (multi-block) path: create-or-conflict, then per ~4 MiB chunk
-/// encrypt+sign+verify+register+upload, then commit. Correct for any file
-/// size — the always-safe fallback (see Global Constraints).
-fn upload_general(ctx: &UploadContext, file: &mut File) -> Result<String> {
-    let file_creation = FileCreationRequest {
+/// The new-node fields both upload paths need on a brand-new file: `ctx`'s
+/// freshly generated node key/content key, not yet anything server-assigned.
+fn new_node_metadata<'a>(ctx: &UploadContext<'a>) -> NewNodeMetadata<'a> {
+    NewNodeMetadata {
         name: ctx.encrypted_name,
         name_hash_digest: ctx.name_hash_digest,
         parent_link_id: &ctx.folder.folder_link_id,
@@ -203,6 +202,15 @@ fn upload_general(ctx: &UploadContext, file: &mut File) -> Result<String> {
         media_type: ctx.media_type,
         content_key_packet: &ctx.content_key.packet_b64,
         content_key_signature: &ctx.content_key.packet_signature_armored,
+    }
+}
+
+/// General (multi-block) path: create-or-conflict, then per ~4 MiB chunk
+/// encrypt+sign+verify+register+upload, then commit. Correct for any file
+/// size — the always-safe fallback (see Global Constraints).
+fn upload_general(ctx: &UploadContext, file: &mut File) -> Result<String> {
+    let file_creation = FileCreationRequest {
+        node: new_node_metadata(ctx),
         client_uid: None,
         intended_upload_size: ctx.file_size as i64,
         signature_email_address: &ctx.address.email,
@@ -321,19 +329,13 @@ fn upload_small(ctx: &UploadContext, file: &mut File) -> Result<String> {
     let xattr_armored = build_xattr(file, total_size, vec![total_size], sha1_hex.clone(), &node_key)?;
 
     let new_file_metadata = SmallFileUploadMetadata {
-        name: ctx.encrypted_name,
-        name_hash_digest: ctx.name_hash_digest,
-        parent_link_id: &ctx.folder.folder_link_id,
-        node_passphrase: &ctx.new_node_key.encrypted_passphrase_armored,
-        node_passphrase_signature: &ctx.new_node_key.passphrase_signature_armored,
-        node_key: &ctx.new_node_key.armored_key,
-        media_type: ctx.media_type,
-        content_key_packet: &ctx.content_key.packet_b64,
-        content_key_signature: &ctx.content_key.packet_signature_armored,
-        signature_email_address: &ctx.address.email,
-        manifest_signature: &manifest_signature,
-        checksum_verified: true,
-        extended_attributes: &xattr_armored,
+        node: new_node_metadata(ctx),
+        revision: RevisionUpdateRequest {
+            manifest_signature: &manifest_signature,
+            signature_email_address: &ctx.address.email,
+            checksum_verified: true,
+            extended_attributes: &xattr_armored,
+        },
     };
 
     match upload_small_file(ctx.client, &ctx.folder.volume_id, &new_file_metadata, &encrypted_block.ciphertext)? {
@@ -360,7 +362,7 @@ fn upload_small(ctx: &UploadContext, file: &mut File) -> Result<String> {
             let manifest_signature = build_manifest_signature(&[encrypted_block.sha256_hash], ctx.address_key)?;
             let xattr_armored = build_xattr(file, total_size, vec![total_size], sha1_hex, &existing_node_key)?;
 
-            let revision_metadata = SmallRevisionUploadMetadata {
+            let revision_metadata = RevisionUpdateRequest {
                 signature_email_address: &ctx.address.email,
                 manifest_signature: &manifest_signature,
                 checksum_verified: true,

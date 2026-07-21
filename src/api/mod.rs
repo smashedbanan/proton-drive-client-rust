@@ -8,6 +8,21 @@ pub mod account;
 pub mod auth;
 pub mod drive;
 
+/// A single OpenPGP key entry, as returned in the identical shape for both a
+/// user's own keys (`core/v4/users`) and an address's keys
+/// (`core/v4/addresses`). Never derive Debug — holds an armored private key.
+#[derive(Deserialize)]
+pub struct KeyEntry {
+    #[serde(rename = "ID")]
+    pub id: String,
+    #[serde(rename = "PrivateKey")]
+    pub private_key: String,
+    #[serde(rename = "Primary")]
+    pub primary: i64,
+    #[serde(rename = "Active")]
+    pub active: i64,
+}
+
 /// Every Proton API response carries a top-level Code (1000 == success) and,
 /// on failure, an Error message — independent of HTTP status. We disable
 /// ureq's automatic status-code-as-error behavior so we always get the body
@@ -56,13 +71,7 @@ impl ApiClient {
 
     pub fn get<Resp: DeserializeOwned>(&self, path: &str) -> Result<Resp> {
         let url = format!("{API_BASE_URL}/{path}");
-        let req = self.agent.get(&url).header("x-pm-appversion", APP_VERSION);
-        let req = if let Some((uid, token)) = &self.session {
-            req.header("x-pm-uid", uid)
-                .header("Authorization", &format!("Bearer {token}"))
-        } else {
-            req
-        };
+        let req = self.with_auth(self.agent.get(&url).header("x-pm-appversion", APP_VERSION));
         let response = req
             .call()
             .map_err(|e| Error::Network(e.to_string()))?;
@@ -82,17 +91,12 @@ impl ApiClient {
         query_value: &str,
     ) -> Result<Resp> {
         let url = format!("{API_BASE_URL}/{path}");
-        let req = self
-            .agent
-            .get(&url)
-            .header("x-pm-appversion", APP_VERSION)
-            .query(query_key, query_value);
-        let req = if let Some((uid, token)) = &self.session {
-            req.header("x-pm-uid", uid)
-                .header("Authorization", &format!("Bearer {token}"))
-        } else {
-            req
-        };
+        let req = self.with_auth(
+            self.agent
+                .get(&url)
+                .header("x-pm-appversion", APP_VERSION)
+                .query(query_key, query_value),
+        );
         let response = req
             .call()
             .map_err(|e| Error::Network(e.to_string()))?;
@@ -105,13 +109,7 @@ impl ApiClient {
         body: &Req,
     ) -> Result<Resp> {
         let url = format!("{API_BASE_URL}/{path}");
-        let req = self.agent.post(&url).header("x-pm-appversion", APP_VERSION);
-        let req = if let Some((uid, token)) = &self.session {
-            req.header("x-pm-uid", uid)
-                .header("Authorization", &format!("Bearer {token}"))
-        } else {
-            req
-        };
+        let req = self.with_auth(self.agent.post(&url).header("x-pm-appversion", APP_VERSION));
         let response = req
             .send_json(body)
             .map_err(|e| Error::Network(e.to_string()))?;
@@ -124,13 +122,7 @@ impl ApiClient {
         body: &Req,
     ) -> Result<Resp> {
         let url = format!("{API_BASE_URL}/{path}");
-        let req = self.agent.put(&url).header("x-pm-appversion", APP_VERSION);
-        let req = if let Some((uid, token)) = &self.session {
-            req.header("x-pm-uid", uid)
-                .header("Authorization", &format!("Bearer {token}"))
-        } else {
-            req
-        };
+        let req = self.with_auth(self.agent.put(&url).header("x-pm-appversion", APP_VERSION));
         let response = req
             .send_json(body)
             .map_err(|e| Error::Network(e.to_string()))?;
@@ -144,17 +136,23 @@ impl ApiClient {
     /// host, which uses a distinct `pm-storage-token` and no session header).
     pub fn post_multipart<Resp: DeserializeOwned>(&self, path: &str, form: Form<'_>) -> Result<Resp> {
         let url = format!("{API_BASE_URL}/{path}");
-        let req = self.agent.post(&url).header("x-pm-appversion", APP_VERSION);
-        let req = if let Some((uid, token)) = &self.session {
-            req.header("x-pm-uid", uid)
-                .header("Authorization", &format!("Bearer {token}"))
-        } else {
-            req
-        };
+        let req = self.with_auth(self.agent.post(&url).header("x-pm-appversion", APP_VERSION));
         let response = req
             .send(form)
             .map_err(|e| Error::Network(e.to_string()))?;
         parse_response(response)
+    }
+
+    /// Shared by `get`/`get_with_query`/`post`/`put`/`post_multipart` — every
+    /// authenticated request needs the same two session headers, regardless
+    /// of HTTP method or body type.
+    fn with_auth<S>(&self, req: ureq::RequestBuilder<S>) -> ureq::RequestBuilder<S> {
+        if let Some((uid, token)) = &self.session {
+            req.header("x-pm-uid", uid)
+                .header("Authorization", &format!("Bearer {token}"))
+        } else {
+            req
+        }
     }
 }
 

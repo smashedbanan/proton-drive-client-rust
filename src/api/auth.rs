@@ -1,4 +1,4 @@
-use super::ApiClient;
+use super::{ApiClient, KeyEntry};
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -86,21 +86,9 @@ pub fn fetch_key_salts(client: &ApiClient) -> Result<KeySaltsResponse> {
 }
 
 #[derive(Deserialize)]
-pub struct UserKey {
-    #[serde(rename = "ID")]
-    pub id: String,
-    #[serde(rename = "PrivateKey")]
-    pub private_key: String,
-    #[serde(rename = "Primary")]
-    pub primary: i64,
-    #[serde(rename = "Active")]
-    pub active: i64,
-}
-
-#[derive(Deserialize)]
 pub struct UserObj {
     #[serde(rename = "Keys")]
-    pub keys: Vec<UserKey>,
+    pub keys: Vec<KeyEntry>,
 }
 
 #[derive(Deserialize)]

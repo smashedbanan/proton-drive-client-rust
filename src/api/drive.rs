@@ -119,8 +119,15 @@ pub fn get_link_details(
     client.post(&path, &req)
 }
 
+/// The wire shape shared by both "create a new node" endpoints: a brand-new
+/// file (`FileCreationRequest`) and the small-file combined
+/// create+upload+commit call (`SmallFileUploadMetadata`). Excludes
+/// `SignatureAddress`: the two callers pair it with different siblings
+/// (`FileCreationRequest`'s own field vs. `RevisionUpdateRequest`'s, flattened
+/// into `SmallFileUploadMetadata`), so keeping it out here avoids a duplicate
+/// `SignatureAddress` key where both get flattened into the same struct.
 #[derive(Serialize)]
-pub struct FileCreationRequest<'a> {
+pub struct NewNodeMetadata<'a> {
     #[serde(rename = "Name")]
     pub name: &'a str, // armored PGP message, encrypted to the parent folder's key
     #[serde(rename = "Hash")]
@@ -139,6 +146,12 @@ pub struct FileCreationRequest<'a> {
     pub content_key_packet: &'a str, // base64
     #[serde(rename = "ContentKeyPacketSignature")]
     pub content_key_signature: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct FileCreationRequest<'a> {
+    #[serde(flatten)]
+    pub node: NewNodeMetadata<'a>,
     #[serde(rename = "ClientUID")]
     pub client_uid: Option<&'a str>,
     #[serde(rename = "IntendedUploadSize")]
@@ -250,56 +263,22 @@ pub fn create_revision(
 }
 
 /// Everything `FileCreationRequest` carries, plus the commit-time fields
-/// `RevisionUpdateRequest` (Task 10) otherwise carries separately — folded
-/// into one request because the small path has no separate commit step.
-/// Field-by-field correspondence with `FileCreationRequest` (above) and
-/// `RevisionUpdateRequest` (Task 10) is exact; this struct exists only
-/// because the small path sends them together as one JSON `Metadata`
-/// multipart part rather than as two separate request bodies.
+/// `RevisionUpdateRequest` otherwise carries separately — folded into one
+/// request because the small path has no separate commit step. This struct
+/// exists only because the small path sends them together as one JSON
+/// `Metadata` multipart part rather than as two separate request bodies; the
+/// existing-node ("new revision") small-upload call reuses
+/// `RevisionUpdateRequest` directly instead of needing a variant of this
+/// struct, since it has no node keypair/content-key fields to add (those
+/// already exist on the target node and aren't regenerated — matching
+/// `generate_content_key`'s doc comment: a content key is per-file, generated
+/// once, reused across revisions).
 #[derive(Serialize)]
 pub struct SmallFileUploadMetadata<'a> {
-    #[serde(rename = "Name")]
-    pub name: &'a str,
-    #[serde(rename = "Hash")]
-    pub name_hash_digest: &'a str,
-    #[serde(rename = "ParentLinkID")]
-    pub parent_link_id: &'a str,
-    #[serde(rename = "NodePassphrase")]
-    pub node_passphrase: &'a str,
-    #[serde(rename = "NodePassphraseSignature")]
-    pub node_passphrase_signature: &'a str,
-    #[serde(rename = "NodeKey")]
-    pub node_key: &'a str,
-    #[serde(rename = "MIMEType")]
-    pub media_type: &'a str,
-    #[serde(rename = "ContentKeyPacket")]
-    pub content_key_packet: &'a str,
-    #[serde(rename = "ContentKeyPacketSignature")]
-    pub content_key_signature: &'a str,
-    #[serde(rename = "SignatureAddress")]
-    pub signature_email_address: &'a str,
-    #[serde(rename = "ManifestSignature")]
-    pub manifest_signature: &'a str,
-    #[serde(rename = "ChecksumVerified")]
-    pub checksum_verified: bool,
-    #[serde(rename = "XAttr")]
-    pub extended_attributes: &'a str,
-}
-
-/// The existing-node ("new revision") variant — no node keypair/content-key
-/// fields, since those already exist on the target node and aren't
-/// regenerated (matching Task 5's `generate_content_key` doc comment: a
-/// content key is per-file, generated once, reused across revisions).
-#[derive(Serialize)]
-pub struct SmallRevisionUploadMetadata<'a> {
-    #[serde(rename = "SignatureAddress")]
-    pub signature_email_address: &'a str,
-    #[serde(rename = "ManifestSignature")]
-    pub manifest_signature: &'a str,
-    #[serde(rename = "ChecksumVerified")]
-    pub checksum_verified: bool,
-    #[serde(rename = "XAttr")]
-    pub extended_attributes: &'a str,
+    #[serde(flatten)]
+    pub node: NewNodeMetadata<'a>,
+    #[serde(flatten)]
+    pub revision: RevisionUpdateRequest<'a>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -342,12 +321,15 @@ pub fn upload_small_file(
 }
 
 /// `POST v2/volumes/{volumeId}/files/{linkId}/revisions/small` — existing
-/// node, small-upload path.
+/// node, small-upload path. Takes `RevisionUpdateRequest` directly (the same
+/// type `commit_revision`'s general path uses) rather than a dedicated
+/// struct: this call has no node keypair/content-key fields to add, so
+/// there's nothing left over once the shared commit fields are covered.
 pub fn upload_small_revision(
     client: &ApiClient,
     volume_id: &str,
     link_id: &str,
-    metadata: &SmallRevisionUploadMetadata,
+    metadata: &RevisionUpdateRequest,
     content_block: &[u8],
 ) -> Result<SmallUploadResponse> {
     let path = format!("v2/volumes/{volume_id}/files/{link_id}/revisions/small");
@@ -430,6 +412,61 @@ mod shape_tests {
         let parsed: SmallUploadResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.file.link_id, "link-3");
         assert_eq!(parsed.file.revision_id, "rev-3");
+    }
+
+    fn sample_node_metadata() -> NewNodeMetadata<'static> {
+        NewNodeMetadata {
+            name: "n",
+            name_hash_digest: "h",
+            parent_link_id: "p",
+            node_passphrase: "np",
+            node_passphrase_signature: "nps",
+            node_key: "nk",
+            media_type: "m",
+            content_key_packet: "ckp",
+            content_key_signature: "cks",
+        }
+    }
+
+    // Regression guard for the `#[serde(flatten)]` refactor: proves the
+    // nested `NewNodeMetadata` serializes to top-level keys (not a nested
+    // "node" object) alongside `FileCreationRequest`'s own fields.
+    #[test]
+    fn file_creation_request_flattens_node_metadata_to_top_level_keys() {
+        let req = FileCreationRequest {
+            node: sample_node_metadata(),
+            client_uid: None,
+            intended_upload_size: 42,
+            signature_email_address: "a@b.com",
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("Name").and_then(|v| v.as_str()), Some("n"));
+        assert_eq!(obj.get("IntendedUploadSize").and_then(|v| v.as_i64()), Some(42));
+        assert_eq!(obj.get("SignatureAddress").and_then(|v| v.as_str()), Some("a@b.com"));
+        assert!(obj.get("node").is_none(), "flatten must not nest NewNodeMetadata under its field name");
+    }
+
+    // Regression guard: `SmallFileUploadMetadata` flattens *two* structs
+    // together — this proves neither their key sets nor `NewNodeMetadata`'s
+    // deliberate exclusion of `SignatureAddress` (see its doc comment) drift
+    // out of sync, which would otherwise silently drop or duplicate a key.
+    #[test]
+    fn small_file_upload_metadata_flattens_both_halves_without_key_collision() {
+        let req = SmallFileUploadMetadata {
+            node: sample_node_metadata(),
+            revision: RevisionUpdateRequest {
+                manifest_signature: "ms",
+                signature_email_address: "a@b.com",
+                checksum_verified: true,
+                extended_attributes: "xattr",
+            },
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.len(), 13, "expected 9 node fields + 4 revision fields with no overlap");
+        assert_eq!(obj.get("SignatureAddress").and_then(|v| v.as_str()), Some("a@b.com"));
+        assert_eq!(obj.get("ManifestSignature").and_then(|v| v.as_str()), Some("ms"));
     }
 }
 

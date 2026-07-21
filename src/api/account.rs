@@ -1,19 +1,6 @@
-use super::ApiClient;
+use super::{ApiClient, KeyEntry};
 use crate::error::Result;
 use serde::Deserialize;
-
-// Holds an armored private key — never derive Debug (see api::auth::UserKey).
-#[derive(Deserialize)]
-pub struct AddressKey {
-    #[serde(rename = "ID")]
-    pub id: String,
-    #[serde(rename = "PrivateKey")]
-    pub private_key: String,
-    #[serde(rename = "Primary")]
-    pub primary: i64,
-    #[serde(rename = "Active")]
-    pub active: i64,
-}
 
 #[derive(Deserialize)]
 pub struct Address {
@@ -22,7 +9,7 @@ pub struct Address {
     #[serde(rename = "Email")]
     pub email: String,
     #[serde(rename = "Keys")]
-    pub keys: Vec<AddressKey>,
+    pub keys: Vec<KeyEntry>,
 }
 
 #[derive(Deserialize)]
