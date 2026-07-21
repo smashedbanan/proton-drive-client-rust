@@ -34,8 +34,12 @@ pub struct Share {
 pub struct LinkFileDetails {
     #[serde(rename = "ContentKeyPacket")]
     pub content_key_packet: String,
+    /// Detached signature over the decrypted content key's raw session-key
+    /// bytes — absent means not signed at all (a real, legitimate case, not
+    /// an error), matching `LinkDetails::node_passphrase_signature`'s own
+    /// pattern.
     #[serde(rename = "ContentKeyPacketSignature")]
-    pub content_key_packet_signature: String,
+    pub content_key_packet_signature: Option<String>,
 }
 
 /// The subset of a link's details needed to decrypt its name and descend
@@ -426,6 +430,17 @@ mod shape_tests {
         let parsed: LinkDetailsResponse = serde_json::from_str(json).unwrap();
         let file = parsed.links[0].file.as_ref().expect("file field should be present");
         assert_eq!(file.content_key_packet, "cpk-b64");
+    }
+
+    #[test]
+    fn link_file_details_content_key_packet_signature_defaults_to_none_when_absent() {
+        let json = r#"{"Links": [
+            {"LinkID": "l1", "Name": "n", "NodeKey": "k", "NodePassphrase": "p",
+             "File": {"ContentKeyPacket": "cpk-b64"}}
+        ]}"#;
+        let parsed: LinkDetailsResponse = serde_json::from_str(json).unwrap();
+        let file = parsed.links[0].file.as_ref().expect("file field should be present");
+        assert_eq!(file.content_key_packet_signature, None);
     }
 
     #[test]

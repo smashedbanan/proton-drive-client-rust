@@ -92,6 +92,25 @@ pub enum SignatureCheck {
 /// SDKs' non-fatal verification model (see the design doc's Background
 /// section). Callers handle `Verified`/`Failed` identically (warn, proceed).
 pub fn verify_signature(armored_signature: Option<&str>, content: &[u8], key: &UnlockedKey) -> SignatureCheck {
+    verify_signature_any(armored_signature, content, &[key])
+}
+
+/// Verifies a detached OpenPGP signature over `content` against ANY of
+/// `keys`, succeeding if at least one matches. This is the content-key
+/// packet's verification model specifically: additive, not exclusive.
+/// Confirmed against the reference SDK: the node's own key is always a
+/// legitimate signer (this crate's own `generate_content_key` always
+/// signs with it — see its doc comment), and the claimed address's key
+/// (if any) is an additional acceptable signer, for compatibility with
+/// clients that historically signed content keys with an address key
+/// instead (`NodeCrypto.cs`'s `GetContentKeyAndHashKeyVerificationKeyRing`;
+/// `cryptoService.ts`'s `decryptContentKeyPacket`, which passes `[key,
+/// ...keyVerificationKeys]` — node key always first, with an inline
+/// comment about the legacy address-key case). Every OTHER signed field
+/// in this protocol (passphrase, name) uses the exclusive claim-or-
+/// parent-fallback model instead (`verify_signature`'s single-key form,
+/// `decrypt_and_verify_name`) — don't reuse this function for those.
+pub fn verify_signature_any(armored_signature: Option<&str>, content: &[u8], keys: &[&UnlockedKey]) -> SignatureCheck {
     let Some(armored_signature) = armored_signature else {
         return SignatureCheck::Failed("not signed".into());
     };
@@ -99,10 +118,12 @@ pub fn verify_signature(armored_signature: Option<&str>, content: &[u8], key: &U
         Ok((sig, _headers)) => sig,
         Err(e) => return SignatureCheck::Failed(format!("bad signature armor: {e}")),
     };
-    match signature.verify(key.secret_key.primary_key.public_key(), content) {
-        Ok(()) => SignatureCheck::Verified,
-        Err(e) => SignatureCheck::Failed(format!("signature did not verify: {e}")),
+    for key in keys {
+        if signature.verify(key.secret_key.primary_key.public_key(), content).is_ok() {
+            return SignatureCheck::Verified;
+        }
     }
+    SignatureCheck::Failed("signature did not verify against any candidate key".into())
 }
 
 /// Decrypts `armored_message` (a Drive node name — the one field in this
@@ -1326,6 +1347,37 @@ mod signature_tests {
     fn verify_signature_treats_absent_signature_as_not_signed() {
         let key = generate_test_key("signer", "signer passphrase");
         assert!(matches!(verify_signature(None, b"content", &key), SignatureCheck::Failed(_)));
+    }
+
+    #[test]
+    fn verify_signature_any_accepts_the_first_matching_key() {
+        let node_key = generate_test_key("node", "node passphrase");
+        let other_key = generate_test_key("other", "other passphrase");
+        let content = b"a content key's raw session-key bytes";
+        let signature = sign_detached(content, &node_key).unwrap();
+        assert!(matches!(
+            verify_signature_any(Some(&signature), content, &[&other_key, &node_key]),
+            SignatureCheck::Verified
+        ));
+    }
+
+    #[test]
+    fn verify_signature_any_fails_when_no_candidate_matches() {
+        let signer = generate_test_key("signer", "signer passphrase");
+        let a = generate_test_key("a", "a passphrase");
+        let b = generate_test_key("b", "b passphrase");
+        let content = b"a content key's raw session-key bytes";
+        let signature = sign_detached(content, &signer).unwrap();
+        assert!(matches!(
+            verify_signature_any(Some(&signature), content, &[&a, &b]),
+            SignatureCheck::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn verify_signature_any_treats_absent_signature_as_not_signed() {
+        let key = generate_test_key("signer", "signer passphrase");
+        assert!(matches!(verify_signature_any(None, b"content", &[&key]), SignatureCheck::Failed(_)));
     }
 
     fn build_signed_and_encrypted_name(plaintext: &str, signer: &UnlockedKey, recipient: &UnlockedKey) -> String {

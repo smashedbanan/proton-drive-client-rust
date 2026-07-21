@@ -9,10 +9,10 @@ use crate::api::ApiClient;
 use crate::crypto::{
     build_extended_attributes, build_manifest_signature, compute_verification_token, compute_whole_file_sha1,
     decrypt_block_with_session_key, decrypt_existing_content_key, decrypt_message, encrypt_and_sign_block,
-    encrypt_to_key, generate_content_key, generate_node_key, ContentKeyPacket, EncryptedBlock, ExtendedAttributes,
-    ExtendedAttributesCommon, ExtendedAttributesDigests, NewNodeKey, UnlockedKey,
+    encrypt_to_key, generate_content_key, generate_node_key, verify_signature_any, ContentKeyPacket, EncryptedBlock,
+    ExtendedAttributes, ExtendedAttributesCommon, ExtendedAttributesDigests, NewNodeKey, UnlockedKey,
 };
-use crate::drive::{resolve_path, verify_claim, warn_on_signature_failure, ResolvedFolder};
+use crate::drive::{resolve_path, resolve_verifying_key, verify_claim, warn_on_signature_failure, ResolvedFolder};
 use crate::error::{Error, Result};
 use crate::session;
 use base64::Engine;
@@ -209,15 +209,23 @@ fn resolve_existing_node_key_and_content_key(
         .as_ref()
         .ok_or_else(|| Error::Crypto("conflicting node has no file content-key material".into()))?;
     let content_key = decrypt_existing_content_key(&file_details.content_key_packet, &node_key)?;
+    // Content-key packet verification is additive, not exclusive (unlike
+    // the passphrase check above): this crate's own `generate_content_key`
+    // always signs with the node's own key, and the reference SDKs confirm
+    // the node key is always a legitimate signer, with the claimed
+    // address's key an additional acceptable one (legacy client
+    // compatibility) — see `crypto::verify_signature_any`'s doc comment.
+    let claimed_key = resolve_verifying_key(link.signature_email.as_deref(), ctx.addresses, ctx.key_password, None).ok();
+    let mut verifiers: Vec<&UnlockedKey> = vec![&node_key];
+    if let Some(ref key) = claimed_key {
+        verifiers.push(key);
+    }
     warn_on_signature_failure(
         &format!("conflicting node {existing_link_id}'s content-key packet"),
-        verify_claim(
-            link.signature_email.as_deref(),
-            ctx.addresses,
-            ctx.key_password,
-            Some(&ctx.folder.folder_key),
-            Some(file_details.content_key_packet_signature.as_str()),
+        verify_signature_any(
+            file_details.content_key_packet_signature.as_deref(),
             content_key.content_key.as_ref(),
+            &verifiers,
         ),
     );
     Ok((node_key, content_key))
