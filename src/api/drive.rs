@@ -762,6 +762,33 @@ pub fn upload_block_bytes(agent: &ureq::Agent, target: &BlockUploadTarget, ciphe
     Ok(())
 }
 
+/// Downloads one block's encrypted bytes directly from its per-block
+/// `bare_url`, authenticated by the `pm-storage-token` header (not the
+/// crate's normal session bearer token) — the exact mirror of
+/// `upload_block_bytes` above, reversed direction (`GET` instead of a
+/// multipart `POST`). Confirmed against the reference SDK's own
+/// `getBlockStream` (`client/js/src/internal/apiService/apiService.ts:215-221`)
+/// and its test asserting the `pm-storage-token` header
+/// (`apiService.test.ts`).
+pub fn download_block_bytes(agent: &ureq::Agent, bare_url: &str, token: &str) -> Result<Vec<u8>> {
+    let mut response = agent
+        .get(bare_url)
+        .header("x-pm-appversion", APP_VERSION)
+        .header("pm-storage-token", token)
+        .call()
+        .map_err(|e| Error::Network(e.to_string()))?;
+    if !response.status().is_success() {
+        return Err(Error::Network(format!(
+            "block download failed: storage host returned HTTP {}",
+            response.status()
+        )));
+    }
+    response
+        .body_mut()
+        .read_to_vec()
+        .map_err(|e| Error::Network(e.to_string()))
+}
+
 #[derive(Deserialize, Debug)]
 pub struct VerificationInput {
     #[serde(rename = "VerificationCode")]
