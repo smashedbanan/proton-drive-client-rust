@@ -36,6 +36,7 @@ pub fn unlock_private_key(armored: &str, passphrase: &str) -> Result<()> {
 /// armored text. Used for the account's address key, and for every node key
 /// encountered while walking a Drive path (the "My files" share key, and
 /// each folder's own key going down the tree).
+#[derive(Clone)]
 pub struct UnlockedKey {
     secret_key: SignedSecretKey,
     passphrase: String,
@@ -74,6 +75,70 @@ pub fn decrypt_message(armored_message: &str, key: &UnlockedKey) -> Result<Strin
         .as_data_vec()
         .map_err(|e| Error::Crypto(format!("failed to read decrypted message: {e}")))?;
     String::from_utf8(bytes).map_err(|e| Error::Crypto(format!("decrypted message was not valid UTF-8: {e}")))
+}
+
+pub enum SignatureCheck {
+    Verified,
+    Failed(String),
+}
+
+/// Verifies a detached OpenPGP signature over `content` against `key`'s
+/// public half. `armored_signature: None` means "not signed" (the
+/// signature blob itself was absent on the wire — a real, legitimate case
+/// confirmed against the reference SDK's nullable `PgpArmoredSignature?`),
+/// checked before any parsing is attempted. Never returns `Result`: every
+/// failure mode (not signed, malformed armor, wrong key, non-matching
+/// signature) collapses to `Failed(reason)` — matching the reference
+/// SDKs' non-fatal verification model (see the design doc's Background
+/// section). Callers handle `Verified`/`Failed` identically (warn, proceed).
+pub fn verify_signature(armored_signature: Option<&str>, content: &[u8], key: &UnlockedKey) -> SignatureCheck {
+    let Some(armored_signature) = armored_signature else {
+        return SignatureCheck::Failed("not signed".into());
+    };
+    let signature = match pgp::composed::DetachedSignature::from_string(armored_signature) {
+        Ok((sig, _headers)) => sig,
+        Err(e) => return SignatureCheck::Failed(format!("bad signature armor: {e}")),
+    };
+    match signature.verify(key.secret_key.primary_key.public_key(), content) {
+        Ok(()) => SignatureCheck::Verified,
+        Err(e) => SignatureCheck::Failed(format!("signature did not verify: {e}")),
+    }
+}
+
+/// Decrypts `armored_message` (a Drive node name — the one field in this
+/// protocol whose signature is embedded in the encrypted message itself,
+/// not a sibling detached-signature field; confirmed against the
+/// reference SDK's own `decryptNodeName` doc comment — see the design
+/// doc's Background section) and, if `verifier` resolved to a key, checks
+/// the embedded signature against it. Decryption failure is still a hard
+/// `Err`, matching `decrypt_message`'s existing behavior; verification
+/// never is — an unresolved `verifier` (`Err(reason)`, produced by
+/// `drive::resolve_verifying_key`) or a non-matching signature both come
+/// back as `Ok((plaintext, SignatureCheck::Failed(_)))`.
+pub fn decrypt_and_verify_name(
+    armored_message: &str,
+    key: &UnlockedKey,
+    verifier: std::result::Result<UnlockedKey, String>,
+) -> Result<(String, SignatureCheck)> {
+    let (message, _headers) = Message::from_reader(armored_message.as_bytes())
+        .map_err(|e| Error::Crypto(format!("bad encrypted message: {e}")))?;
+    let mut decrypted = message
+        .decrypt(&Password::from(key.passphrase.as_str()), &key.secret_key)
+        .map_err(|e| Error::Crypto(format!("failed to decrypt message: {e}")))?;
+    let bytes = decrypted
+        .as_data_vec()
+        .map_err(|e| Error::Crypto(format!("failed to read decrypted message: {e}")))?;
+    let plaintext = String::from_utf8(bytes)
+        .map_err(|e| Error::Crypto(format!("decrypted message was not valid UTF-8: {e}")))?;
+
+    let check = match verifier {
+        Err(reason) => SignatureCheck::Failed(reason),
+        Ok(verifier_key) => match decrypted.verify(verifier_key.secret_key.primary_key.public_key()) {
+            Ok(_signature) => SignatureCheck::Verified,
+            Err(e) => SignatureCheck::Failed(format!("embedded signature did not verify: {e}")),
+        },
+    };
+    Ok((plaintext, check))
 }
 
 /// A freshly generated node keypair (for a new file or folder), plus the
@@ -1209,5 +1274,112 @@ mod manifest_tests {
         decrypted
             .verify(node_key.secret_key.primary_key.public_key())
             .expect("XAttr message's inline signature should verify against the node key's own public half");
+    }
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+    use pgp::composed::{KeyType, SecretKeyParamsBuilder};
+
+    fn generate_test_key(name: &str, passphrase: &str) -> UnlockedKey {
+        let mut key_params = SecretKeyParamsBuilder::default();
+        key_params
+            .key_type(KeyType::Rsa(2048))
+            .can_sign(true)
+            .primary_user_id(format!("{name} <{name}@example.com>"))
+            .passphrase(Some(passphrase.to_string()));
+        let params = key_params.build().expect("valid key params");
+        let signed_secret_key = params.generate(rand08::rngs::OsRng).expect("key generation should succeed");
+        let armored = signed_secret_key.to_armored_string(Default::default()).unwrap();
+        UnlockedKey::new(&armored, passphrase.to_string()).unwrap()
+    }
+
+    #[test]
+    fn verify_signature_accepts_a_real_signature() {
+        let key = generate_test_key("signer", "signer passphrase");
+        let content = b"a node passphrase, decrypted";
+        let signature = sign_detached(content, &key).unwrap();
+        assert!(matches!(verify_signature(Some(&signature), content, &key), SignatureCheck::Verified));
+    }
+
+    #[test]
+    fn verify_signature_rejects_tampered_content() {
+        let key = generate_test_key("signer", "signer passphrase");
+        let signature = sign_detached(b"original content", &key).unwrap();
+        assert!(matches!(
+            verify_signature(Some(&signature), b"tampered content", &key),
+            SignatureCheck::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn verify_signature_rejects_wrong_key() {
+        let signer = generate_test_key("signer", "signer passphrase");
+        let other = generate_test_key("other", "other passphrase");
+        let content = b"a node passphrase, decrypted";
+        let signature = sign_detached(content, &signer).unwrap();
+        assert!(matches!(verify_signature(Some(&signature), content, &other), SignatureCheck::Failed(_)));
+    }
+
+    #[test]
+    fn verify_signature_treats_absent_signature_as_not_signed() {
+        let key = generate_test_key("signer", "signer passphrase");
+        assert!(matches!(verify_signature(None, b"content", &key), SignatureCheck::Failed(_)));
+    }
+
+    fn build_signed_and_encrypted_name(plaintext: &str, signer: &UnlockedKey, recipient: &UnlockedKey) -> String {
+        // `.to_vec()` (owned), not a borrowed `plaintext.as_bytes()`: `bytes::Bytes`
+        // (what `MessageBuilder::from_bytes`'s `impl Into<Bytes>` bound resolves
+        // to) only implements `From<&'static [u8]>`, not `From<&'a [u8]>` for a
+        // shorter-lived borrow — confirmed by the E0521 "borrowed data escapes
+        // outside of function" this produced as originally written. Same
+        // constraint `encrypt_to_key` above already works around with
+        // `plaintext.to_vec()`.
+        let mut builder = pgp::composed::MessageBuilder::from_bytes("", plaintext.as_bytes().to_vec())
+            .seipd_v1(rand08::rngs::OsRng, SymmetricKeyAlgorithm::AES256);
+        builder.sign(&signer.secret_key.primary_key, Password::from(signer.passphrase.as_str()), HashAlgorithm::Sha256);
+        builder
+            .encrypt_to_key(rand08::rngs::OsRng, &recipient.secret_key.to_public_key())
+            .expect("adding recipient should succeed");
+        builder
+            .to_armored_string(rand08::rngs::OsRng, Default::default())
+            .expect("armoring should succeed")
+    }
+
+    #[test]
+    fn decrypt_and_verify_name_accepts_a_real_embedded_signature() {
+        let parent = generate_test_key("parent", "parent passphrase");
+        let signer = generate_test_key("signer", "signer passphrase");
+        let armored = build_signed_and_encrypted_name("a decrypted node name", &signer, &parent);
+
+        let (name, check) = decrypt_and_verify_name(&armored, &parent, Ok(signer)).unwrap();
+        assert_eq!(name, "a decrypted node name");
+        assert!(matches!(check, SignatureCheck::Verified));
+    }
+
+    #[test]
+    fn decrypt_and_verify_name_rejects_wrong_verifier() {
+        let parent = generate_test_key("parent", "parent passphrase");
+        let signer = generate_test_key("signer", "signer passphrase");
+        let wrong_verifier = generate_test_key("impostor", "impostor passphrase");
+        let armored = build_signed_and_encrypted_name("a decrypted node name", &signer, &parent);
+
+        let (name, check) = decrypt_and_verify_name(&armored, &parent, Ok(wrong_verifier)).unwrap();
+        assert_eq!(name, "a decrypted node name");
+        assert!(matches!(check, SignatureCheck::Failed(_)));
+    }
+
+    #[test]
+    fn decrypt_and_verify_name_surfaces_an_unresolved_verifier_reason_without_erroring_decryption() {
+        let parent = generate_test_key("parent", "parent passphrase");
+        let signer = generate_test_key("signer", "signer passphrase");
+        let armored = build_signed_and_encrypted_name("a decrypted node name", &signer, &parent);
+
+        let (name, check) =
+            decrypt_and_verify_name(&armored, &parent, Err("no claimed signer and no verifier available".into()))
+                .unwrap();
+        assert_eq!(name, "a decrypted node name");
+        assert!(matches!(check, SignatureCheck::Failed(reason) if reason == "no claimed signer and no verifier available"));
     }
 }
