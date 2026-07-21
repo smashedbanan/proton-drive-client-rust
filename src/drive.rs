@@ -1,4 +1,4 @@
-use crate::api::drive::{fetch_my_files_share, get_link_details, list_folder_children};
+use crate::api::drive::{get_link_details, list_folder_children, ShareResponse};
 use crate::api::ApiClient;
 use crate::crypto::{decrypt_message, UnlockedKey};
 use crate::error::{Error, Result};
@@ -19,7 +19,7 @@ pub struct ResolvedFolder {
 /// decrypts and scans each folder's children looking for a name match, so
 /// this does the same: one API round trip (list children) plus one details
 /// fetch per candidate, per path segment.
-pub fn resolve_path(client: &ApiClient, address_key: &UnlockedKey, path: &str) -> Result<ResolvedFolder> {
+pub fn resolve_path(client: &ApiClient, share: ShareResponse, address_key: &UnlockedKey, path: &str) -> Result<ResolvedFolder> {
     let mut segments = path.trim_matches('/').split('/');
     let section = segments.next().unwrap_or("");
     if section != "my-files" {
@@ -28,7 +28,6 @@ pub fn resolve_path(client: &ApiClient, address_key: &UnlockedKey, path: &str) -
         )));
     }
 
-    let share = fetch_my_files_share(client)?;
     let share_passphrase = decrypt_message(&share.share.passphrase, address_key)?;
     let share_key = UnlockedKey::new(&share.share.key, share_passphrase)?;
 

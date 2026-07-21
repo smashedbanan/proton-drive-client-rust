@@ -1,6 +1,6 @@
 use crate::api::account::{fetch_addresses, fetch_feature_flag, Address};
 use crate::api::drive::{
-    commit_revision, create_file, create_revision, get_link_details, get_verification_input,
+    commit_revision, create_file, create_revision, fetch_my_files_share, get_link_details, get_verification_input,
     prepare_block_upload, upload_block_bytes, upload_small_file, upload_small_revision, BlockRegistration,
     CreateFileOutcome, FileCreationRequest, NewNodeMetadata, RevisionCreationRequest, RevisionUpdateRequest,
     SmallFileUploadMetadata, VerifierPayload,
@@ -47,20 +47,28 @@ pub fn run(local_path: &str, remote_path: &str) -> Result<()> {
         .ok_or_else(|| Error::Crypto("local file path has no usable file name".into()))?
         .to_string();
 
+    let share = fetch_my_files_share(&client)?;
     let addresses = fetch_addresses(&client)?;
     let address = addresses
         .addresses
         .iter()
-        .find(|a| a.keys.iter().any(|k| k.primary == 1 && k.active == 1))
-        .ok_or_else(|| Error::Crypto("no active primary address found".into()))?;
+        .find(|a| a.id == share.share.membership_address_id)
+        .ok_or_else(|| {
+            Error::Crypto(format!(
+                "no address found matching the My Files share's owning address ({})",
+                share.share.membership_address_id
+            ))
+        })?;
     let address_key_dto = address
         .keys
         .iter()
         .find(|k| k.primary == 1 && k.active == 1)
-        .expect("checked above");
+        .ok_or_else(|| {
+            Error::Crypto(format!("address {} (My Files share owner) has no active primary key", address.id))
+        })?;
     let address_key = UnlockedKey::new(&address_key_dto.private_key, creds.user_key_password.clone())?;
 
-    let folder = resolve_path(&client, &address_key, remote_path)?;
+    let folder = resolve_path(&client, share, &address_key, remote_path)?;
 
     let name_hash_digest = hex::encode(Sha256::digest(file_name.as_bytes()));
     let new_node_key = generate_node_key(&folder.folder_key, &address_key)?;
