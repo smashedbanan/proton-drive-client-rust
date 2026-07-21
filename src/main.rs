@@ -18,8 +18,9 @@ fn main() {
         Command::Login => commands::login::run(),
         Command::Logout => commands::logout::run(),
         Command::Upload { local, remote } => commands::upload::run(&local, &remote),
-        // ponytail: stub, Task 3 only adds the CLI variant — real dispatch lands in Task 11.
-        Command::Download { .. } => todo!("wire up in Task 11"),
+        Command::Download { remote, local, conflict_strategy } => {
+            commands::download::run(&remote, &local, conflict_strategy)
+        }
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
